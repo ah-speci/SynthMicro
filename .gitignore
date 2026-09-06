@@ -1,1 +1,10 @@
 .ipynb_checkpoints/
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated Grad-CAM test output
+gradcam_result.png
