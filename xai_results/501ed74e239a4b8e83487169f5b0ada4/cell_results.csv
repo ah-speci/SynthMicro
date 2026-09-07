@@ -1,0 +1,2 @@
+cell_id,area,x,y,width,height,purple_score,predicted_class,confidence,confidence_percent
+8,20710,224,229,168,171,71.22793579101562,basophil,0.97583836,97.58384

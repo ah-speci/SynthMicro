@@ -1,0 +1,2 @@
+cell_id,area,x,y,width,height,purple_score,predicted_class,confidence,confidence_percent
+1,26655,217,216,184,188,47.60397720336914,myeloblast,0.9997762,99.977615

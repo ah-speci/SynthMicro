@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
 const API_URL = "http://127.0.0.1:8000";
@@ -7,52 +7,27 @@ const CLASS_INFO = {
   basophil: {
     title: "Basophil",
     category: "White Blood Cell",
-    description:
-      "A granulocyte associated with immune and inflammatory responses.",
-    short:
-      "Model-detected basophil morphology",
   },
-
   erythroblast: {
     title: "Erythroblast",
     category: "Red Blood Cell Precursor",
-    description:
-      "An immature red blood cell precursor observed during erythropoiesis.",
-    short:
-      "Model-detected erythroblast morphology",
   },
-
   monocyte: {
     title: "Monocyte",
     category: "White Blood Cell",
-    description:
-      "A large white blood cell involved in immune defense and tissue response.",
-    short:
-      "Model-detected monocyte morphology",
   },
-
   myeloblast: {
     title: "Myeloblast",
     category: "Immature Myeloid Cell",
-    description:
-      "An immature myeloid precursor cell identified from microscopic morphology.",
-    short:
-      "Model-detected myeloblast morphology",
   },
-
   seg_neutrophil: {
     title: "Segmented Neutrophil",
     category: "White Blood Cell",
-    description:
-      "A mature neutrophil involved in the body's innate immune response.",
-    short:
-      "Model-detected segmented neutrophil morphology",
   },
 };
 
 function formatClassName(name) {
   if (!name) return "";
-
   return name
     .replaceAll("_", " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
@@ -62,84 +37,53 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [preview, setPreview] = useState(null);
   const [result, setResult] = useState(null);
-
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-
-  const [viewMode, setViewMode] = useState("overlay");
-  const [heatmapOpacity, setHeatmapOpacity] = useState(0.45);
   const [dragActive, setDragActive] = useState(false);
-
-  // =========================================================
-  // CLEANUP
-  // =========================================================
+  const [viewMode, setViewMode] = useState("original");
+  const [selectedXaiCell, setSelectedXaiCell] = useState(null);
 
   useEffect(() => {
     return () => {
-      if (preview) {
-        URL.revokeObjectURL(preview);
-      }
+      if (preview) URL.revokeObjectURL(preview);
     };
   }, [preview]);
-
-  // =========================================================
-  // FILE HANDLING
-  // =========================================================
 
   const processFile = (file) => {
     if (!file) return;
 
     if (!file.type.startsWith("image/")) {
-      setError("Please select a valid microscopy image.");
+      setError("Please select a valid blood-smear image.");
       return;
     }
 
-    if (file.size > 10 * 1024 * 1024) {
-      setError("Image size must be less than 10 MB.");
+    if (file.size > 20 * 1024 * 1024) {
+      setError("Image size must be less than 20 MB.");
       return;
     }
 
-    if (preview) {
-      URL.revokeObjectURL(preview);
-    }
-
+    if (preview) URL.revokeObjectURL(preview);
     setSelectedFile(file);
     setPreview(URL.createObjectURL(file));
     setResult(null);
     setError("");
-    setViewMode("overlay");
+    setViewMode("original");
+    setSelectedXaiCell(null);
   };
 
   const handleFileChange = (event) => {
     processFile(event.target.files?.[0]);
   };
 
-  const handleDragOver = (event) => {
-    event.preventDefault();
-    setDragActive(true);
-  };
-
-  const handleDragLeave = (event) => {
-    event.preventDefault();
-    setDragActive(false);
-  };
-
   const handleDrop = (event) => {
     event.preventDefault();
     setDragActive(false);
-
-    const file = event.dataTransfer.files?.[0];
-
-    processFile(file);
+    processFile(event.dataTransfer.files?.[0]);
   };
-
-  // =========================================================
-  // ANALYZE
-  // =========================================================
 
   const analyzeImage = async () => {
     if (!selectedFile) {
-      setError("Please select an image first.");
+      setError("Please select a whole blood-smear image first.");
       return;
     }
 
@@ -149,1283 +93,485 @@ function App() {
 
     try {
       const formData = new FormData();
-
       formData.append("file", selectedFile);
 
-      const response = await fetch(
-        `${API_URL}/predict`,
-        {
-          method: "POST",
-          body: formData,
-        }
-      );
+      const response = await fetch(`${API_URL}/predict`, {
+        method: "POST",
+        body: formData,
+      });
 
-      let data;
+      const data = await response.json();
 
-      try {
-        data = await response.json();
-      } catch {
+      if (!response.ok || !data.success) {
         throw new Error(
-          "The backend returned an invalid response."
+          data?.error || `Backend error (${response.status})`
         );
       }
 
-      if (!response.ok) {
-        throw new Error(
-          data?.detail ||
-            data?.error ||
-            `Backend error (${response.status})`
-        );
-      }
+      const normalized = {
+        ...data,
+        originalUrl: data.original_url
+          ? `${API_URL}${data.original_url}`
+          : preview,
+        overlayUrl: data.overlay_url
+          ? `${API_URL}${data.overlay_url}`
+          : null,
+        reportUrl: data.report_url
+          ? `${API_URL}${data.report_url}`
+          : null,
+        gradcamRecords: (data.gradcam_records || []).map((item) => ({
+          ...item,
+          image_url: `${API_URL}${item.image_url}`,
+        })),
+        shapRecords: (data.shap_records || []).map((item) => ({
+          ...item,
+          image_url: `${API_URL}${item.image_url}`,
+        })),
+      };
 
-      if (!data.success) {
-        throw new Error(
-          data?.error ||
-            "The image could not be analyzed."
-        );
+      setResult(normalized);
+      if (normalized.gradcamRecords.length > 0) {
+        setSelectedXaiCell(normalized.gradcamRecords[0].cell_id);
       }
-
-      setResult(data);
       setViewMode("overlay");
 
-      // Smoothly move user toward results
       setTimeout(() => {
         document
           .getElementById("analysis-results")
-          ?.scrollIntoView({
-            behavior: "smooth",
-            block: "start",
-          });
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
       }, 100);
     } catch (err) {
       console.error(err);
-
-      if (
-        err.name === "TypeError" &&
-        err.message.includes("fetch")
-      ) {
-        setError(
-          "Unable to connect to the AI backend. Make sure FastAPI is running on port 8000."
-        );
-      } else {
-        setError(
-          err.message ||
-            "Unable to analyze the image."
-        );
-      }
+      setError(
+        err?.message?.includes("fetch")
+          ? "Unable to connect to the FastAPI backend on port 8000."
+          : err.message || "Unable to analyze the blood smear."
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  // =========================================================
-  // RESET
-  // =========================================================
-
   const resetAnalysis = () => {
-    if (preview) {
-      URL.revokeObjectURL(preview);
-    }
-
+    if (preview) URL.revokeObjectURL(preview);
     setSelectedFile(null);
     setPreview(null);
     setResult(null);
     setError("");
-    setViewMode("overlay");
-    setHeatmapOpacity(0.45);
+    setViewMode("original");
+    setSelectedXaiCell(null);
   };
 
-  // =========================================================
-  // RESULT HELPERS
-  // =========================================================
+  const topPrediction = useMemo(() => {
+    if (!result?.probabilities) return null;
+    return Object.entries(result.probabilities).sort(
+      ([, a], [, b]) => b - a
+    )[0];
+  }, [result]);
 
-  const confidencePercentage = result
-    ? Math.min(
-        Math.max(result.confidence * 100, 0),
-        100
-      )
-    : 0;
+  const topConfidence = topPrediction ? topPrediction[1] * 100 : 0;
+  const selectedGradcam =
+    result?.gradcamRecords?.find(
+      (item) => item.cell_id === selectedXaiCell
+    ) || result?.gradcamRecords?.[0];
+  const selectedShap =
+    result?.shapRecords?.find(
+      (item) => item.cell_id === selectedXaiCell
+    ) || result?.shapRecords?.[0];
 
-  const predictedInfo = result
-    ? CLASS_INFO[result.prediction]
-    : null;
-
-  const gradcamOverlay = result?.gradcam_overlay
-    ? `data:image/png;base64,${result.gradcam_overlay}`
-    : result?.gradcam
-    ? `data:image/png;base64,${result.gradcam}`
-    : null;
-
-  const gradcamHeatmap = result?.gradcam_heatmap
-    ? `data:image/png;base64,${result.gradcam_heatmap}`
-    : null;
-
-  const getConfidenceLabel = () => {
-    if (confidencePercentage >= 95) return "Very high";
-    if (confidencePercentage >= 80) return "High";
-    if (confidencePercentage >= 60) return "Moderate";
-    return "Low";
-  };
-
-  // =========================================================
-  // RENDER
-  // =========================================================
+  const screeningTone =
+    result?.screening_level === "ELEVATED_SCREENING_INDICATOR"
+      ? "elevated"
+      : result?.screening_level === "SCREENING_FLAG"
+      ? "flag"
+      : "lower";
 
   return (
     <div className="app">
-
-      {/* =====================================================
-          HEADER
-      ====================================================== */}
-
       <header className="topbar">
         <div className="topbar-inner">
-
           <div className="brand">
-
             <div className="brand-mark">
               <div className="brand-cell"></div>
               <div className="brand-cell"></div>
               <div className="brand-cell"></div>
               <div className="brand-cell"></div>
             </div>
-
             <div className="brand-text">
-              <span className="brand-name">
-                SynthMicro
-              </span>
-
+              <span className="brand-name">SynthMicro</span>
               <span className="brand-subtitle">
-                Microscopic Cell Intelligence
+                Whole-Smear Cell Intelligence
               </span>
             </div>
-
           </div>
 
           <div className="topbar-right">
-
             <div className="model-pill">
               <span className="live-dot"></span>
-              Model Online
+              Cellpose + ResNet50 + XAI
             </div>
-
-            <div className="model-name">
-              ResNet50
-            </div>
-
+            <div className="model-name">Phase 7</div>
           </div>
-
         </div>
       </header>
 
-      {/* =====================================================
-          MAIN
-      ====================================================== */}
-
       <main className="page">
-
-        {/* ===================================================
-            HERO
-        ==================================================== */}
-
         <section className="hero">
-
           <div className="hero-grid">
-
             <div className="hero-content">
-
               <div className="eyebrow">
                 <span className="eyebrow-line"></span>
-                AI-ASSISTED MICROSCOPY
+                WHOLE BLOOD-SMEAR ANALYSIS
               </div>
-
               <h1>
-                Leukemia Cell
-                <span> Classification</span>
+                From Smear to
+                <span> Explainable Analysis</span>
               </h1>
-
               <p className="hero-description">
-                Analyze microscopic blood-cell images with
-                a trained ResNet50 model and understand its
-                predictions through explainable AI.
+                Upload a whole blood smear. SynthMicro segments cells with
+                Cellpose, classifies candidate cells with the 384×384 ResNet50
+                model, generates Grad-CAM and SHAP explanations, and builds a
+                downloadable PDF report.
               </p>
-
               <div className="hero-tags">
-
-                <span>
-                  <b>01</b>
-                  ResNet50
-                </span>
-
-                <span>
-                  <b>02</b>
-                  Grad-CAM
-                </span>
-
-                <span>
-                  <b>03</b>
-                  XAI
-                </span>
-
+                <span><b>01</b> Cellpose</span>
+                <span><b>02</b> ResNet50</span>
+                <span><b>03</b> Grad-CAM + SHAP</span>
+                <span><b>04</b> HF Report</span>
               </div>
-
             </div>
 
             <div className="hero-visual">
-
-  {/* Floating blood cells */}
-  <div className="blood-cell cell-1">
-    <div className="cell-nucleus"></div>
-  </div>
-
-  <div className="blood-cell cell-2">
-    <div className="cell-nucleus"></div>
-  </div>
-
-  <div className="blood-cell cell-3">
-    <div className="cell-nucleus"></div>
-  </div>
-
-  <div className="blood-cell cell-4">
-    <div className="cell-nucleus"></div>
-  </div>
-
-  <div className="blood-cell cell-5">
-    <div className="cell-nucleus"></div>
-  </div>
-
-  <div className="blood-cell cell-6">
-    <div className="cell-nucleus"></div>
-  </div>
-
-  {/* Main scanning area */}
-  <div className="scan-circle">
-
-    <div className="scan-ring ring-one"></div>
-
-    <div className="scan-ring ring-two"></div>
-
-    <div className="scan-cross horizontal"></div>
-
-    <div className="scan-cross vertical"></div>
-
-    <div className="scan-core">
-
-      <div className="core-cell">
-        <div className="core-nucleus"></div>
-      </div>
-
-    </div>
-
-  </div>
-
-  <span className="hero-coordinate">
-    224 × 224
-  </span>
-
-  <span className="scan-label">
-    LIVE ANALYSIS
-  </span>
-
-</div>
+              <div className="blood-cell cell-1"><div className="cell-nucleus"></div></div>
+              <div className="blood-cell cell-2"><div className="cell-nucleus"></div></div>
+              <div className="blood-cell cell-3"><div className="cell-nucleus"></div></div>
+              <div className="blood-cell cell-4"><div className="cell-nucleus"></div></div>
+              <div className="blood-cell cell-5"><div className="cell-nucleus"></div></div>
+              <div className="blood-cell cell-6"><div className="cell-nucleus"></div></div>
+              <div className="scan-circle">
+                <div className="scan-ring ring-one"></div>
+                <div className="scan-ring ring-two"></div>
+                <div className="scan-cross horizontal"></div>
+                <div className="scan-cross vertical"></div>
+                <div className="scan-core">
+                  <div className="core-cell"><div className="core-nucleus"></div></div>
+                </div>
+              </div>
+              <span className="hero-coordinate">384 × 384</span>
+              <span className="scan-label">WHOLE SMEAR</span>
+            </div>
           </div>
-
         </section>
 
-        {/* ===================================================
-            WORKFLOW
-        ==================================================== */}
-
         <div className="workflow">
-
-          <div className="workflow-item active">
-            <span>01</span>
-            Upload specimen
-          </div>
-
+          <div className="workflow-item active"><span>01</span> Upload smear</div>
           <div className="workflow-line"></div>
-
-          <div
-            className={`workflow-item ${
-              result ? "active" : ""
-            }`}
-          >
-            <span>02</span>
-            AI classification
-          </div>
-
+          <div className={`workflow-item ${result ? "active" : ""}`}><span>02</span> Segment & classify</div>
           <div className="workflow-line"></div>
-
-          <div
-            className={`workflow-item ${
-              result ? "active" : ""
-            }`}
-          >
-            <span>03</span>
-            Explain prediction
-          </div>
-
+          <div className={`workflow-item ${result ? "active" : ""}`}><span>03</span> Explain & report</div>
         </div>
 
-        {/* ===================================================
-            UPLOAD
-        ==================================================== */}
-
         <section className="panel upload-panel">
-
           <div className="panel-header">
-
             <div className="panel-heading">
-
-              <div className="panel-index">
-                01
-              </div>
-
+              <div className="panel-index">01</div>
               <div>
-                <span className="panel-kicker">
-                  INPUT SPECIMEN
-                </span>
-
-                <h2>
-                  Upload Cell Image
-                </h2>
-
+                <span className="panel-kicker">INPUT SPECIMEN</span>
+                <h2>Upload Whole Blood Smear</h2>
                 <p>
-                  Provide a microscopic blood-cell image
-                  for model analysis.
+                  Give the backend the complete microscopy image rather than a
+                  pre-cropped cell.
                 </p>
               </div>
-
             </div>
-
-            <div className="format-note">
-              JPG · JPEG · PNG
-              <br />
-              Max 10 MB
-            </div>
-
+            <div className="format-note">JPG · JPEG · PNG<br />Max 20 MB</div>
           </div>
 
           <div
-            className={`drop-zone ${
-              dragActive ? "drag-active" : ""
-            } ${
-              preview ? "has-preview" : ""
-            }`}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
+            className={`drop-zone ${dragActive ? "drag-active" : ""} ${preview ? "has-preview" : ""}`}
+            onDragOver={(event) => { event.preventDefault(); setDragActive(true); }}
+            onDragLeave={(event) => { event.preventDefault(); setDragActive(false); }}
             onDrop={handleDrop}
           >
-
             {!preview ? (
-
               <div className="drop-content">
-
                 <div className="microscope-icon">
-
                   <div className="scope-arm"></div>
                   <div className="scope-head"></div>
                   <div className="scope-stage"></div>
                   <div className="scope-base"></div>
-
                 </div>
-
-                <h3>
-                  Drop your microscopy image here
-                </h3>
-
-                <p>
-                  Drag and drop your file or browse
-                  your computer
-                </p>
-
+                <h3>Drop your blood smear here</h3>
+                <p>Cellpose will segment the complete specimen automatically.</p>
                 <label className="browse-button">
-
                   Browse Files
-
                   <input
                     type="file"
                     accept="image/png,image/jpeg,image/jpg"
                     onChange={handleFileChange}
                   />
-
                 </label>
-
               </div>
-
             ) : (
-
               <div className="preview-layout">
-
                 <div className="preview-image-container">
-
-                  <img
-                    src={preview}
-                    alt="Selected microscopy specimen"
-                  />
-
-                  <div className="preview-badge">
-                    Image ready
-                  </div>
-
+                  <img src={preview} alt="Uploaded blood smear" />
+                  <div className="preview-badge">Smear ready</div>
                 </div>
-
                 <div className="preview-details">
-
-                  <span className="ready-label">
-                    SPECIMEN READY
-                  </span>
-
-                  <h3>
-                    Ready for analysis
-                  </h3>
-
+                  <span className="ready-label">SPECIMEN READY</span>
+                  <h3>Ready for whole-smear analysis</h3>
                   <p>
-                    Your image has been loaded and is
-                    ready to be processed by the
-                    ResNet50 model.
+                    The backend will run Cellpose, classify candidate cells,
+                    generate XAI evidence and build the PDF report.
                   </p>
-
                   <div className="file-meta">
-
-                    <div>
-                      <span>FILE</span>
-                      <strong>
-                        {selectedFile?.name}
-                      </strong>
-                    </div>
-
-                    <div>
-                      <span>SIZE</span>
-                      <strong>
-                        {(
-                          selectedFile?.size /
-                          1024
-                        ).toFixed(1)} KB
-                      </strong>
-                    </div>
-
+                    <div><span>FILE</span><strong>{selectedFile?.name}</strong></div>
+                    <div><span>SIZE</span><strong>{(selectedFile?.size / 1024).toFixed(1)} KB</strong></div>
                   </div>
-
                   <label className="secondary-button">
-
                     Change image
-
                     <input
                       type="file"
                       accept="image/png,image/jpeg,image/jpg"
                       onChange={handleFileChange}
                     />
-
                   </label>
-
                 </div>
-
               </div>
-
             )}
-
           </div>
 
           <div className="upload-footer">
-
             <div className="privacy-note">
-              <span className="shield-icon">
-                ✓
-              </span>
-
-              <span>
-                Image is processed locally by the
-                application backend.
-              </span>
+              <span className="shield-icon">✓</span>
+              <span>Research workflow: uploaded data is processed by the local FastAPI backend.</span>
             </div>
-
             <div className="upload-actions">
-
               {selectedFile && (
-
-                <button
-                  className="text-button"
-                  onClick={resetAnalysis}
-                  disabled={loading}
-                >
-                  Clear
-                </button>
-
+                <button className="text-button" onClick={resetAnalysis} disabled={loading}>Clear</button>
               )}
-
-              <button
-                className="primary-button"
-                onClick={analyzeImage}
-                disabled={!selectedFile || loading}
-              >
-
-                {loading ? (
-
-                  <>
-                    <span className="button-spinner"></span>
-                    Analyzing specimen
-                  </>
-
-                ) : (
-
-                  <>
-                    Analyze specimen
-                    <span>→</span>
-                  </>
-
-                )}
-
+              <button className="primary-button" onClick={analyzeImage} disabled={!selectedFile || loading}>
+                {loading ? <><span className="button-spinner"></span>Running Cellpose + XAI</> : <>Analyze whole smear <span>→</span></>}
               </button>
-
             </div>
-
           </div>
 
-          {error && (
-
-            <div className="error-box">
-              <span>!</span>
-              {error}
-            </div>
-
-          )}
-
+          {error && <div className="error-box"><span>!</span>{error}</div>}
         </section>
 
-        {/* ===================================================
-            RESULTS
-        ==================================================== */}
-
         {result && (
-
-          <section
-            className="results-section"
-            id="analysis-results"
-          >
-
-            {/* =================================================
-                RESULT HEADER
-            ================================================== */}
-
+          <section className="results-section" id="analysis-results">
             <div className="results-heading">
-
               <div>
-
-                <div className="section-eyebrow">
-                  ANALYSIS COMPLETE
-                </div>
-
-                <h2>
-                  Classification Result
-                </h2>
-
+                <div className="section-eyebrow">ANALYSIS COMPLETE</div>
+                <h2>Whole-Smear Screening Result</h2>
                 <p>
-                  The model has analyzed the uploaded
-                  microscopy specimen.
+                  {result.cellpose_objects} Cellpose objects were processed;
+                  {" "}{result.candidate_cells} were retained as nucleated-cell candidates.
                 </p>
-
               </div>
-
-              <button
-                className="outline-button"
-                onClick={resetAnalysis}
-              >
-                + New analysis
-              </button>
-
+              <div className="upload-actions">
+                {result.reportUrl && (
+                  <a className="outline-button" href={result.reportUrl} target="_blank" rel="noreferrer">
+                    Open PDF report ↗
+                  </a>
+                )}
+                <button className="outline-button" onClick={resetAnalysis}>+ New analysis</button>
+              </div>
             </div>
-
-            {/* =================================================
-                PREDICTION CARD
-            ================================================== */}
 
             <div className="prediction-panel">
-
               <div className="prediction-main">
-
-                <div className="prediction-status">
-                  <span className="status-check">
-                    ✓
-                  </span>
-
-                  MODEL PREDICTION
-                </div>
-
-                <h3>
-                  {predictedInfo?.title ||
-                    formatClassName(
-                      result.prediction
-                    )}
-                </h3>
-
+                <div className="prediction-status"><span className="status-check">✓</span> MODEL SUMMARY</div>
+                <h3>{result.screening_label}</h3>
                 <p>
-                  {predictedInfo?.short ||
-                    "Classification generated by the trained model."}
+                  {result.myeloblast_like_cells} myeloblast-like candidates among {result.candidate_cells} nucleated-cell candidates.
                 </p>
-
                 <div className="prediction-category">
-
-                  <span>
-                    Category
-                  </span>
-
-                  <strong>
-                    {predictedInfo?.category ||
-                      "Cell Classification"}
-                  </strong>
-
+                  <span>Myeloblast-like proportion</span>
+                  <strong>{result.myeloblast_like_proportion.toFixed(2)}%</strong>
                 </div>
-
               </div>
 
-              <div className="confidence-panel">
-
-                <div className="confidence-top">
-
-                  <span>
-                    CONFIDENCE
-                  </span>
-
-                  <strong>
-                    {confidencePercentage.toFixed(2)}%
-                  </strong>
-
-                </div>
-
-                <div className="confidence-bar">
-
-                  <div
-                    style={{
-                      width: `${confidencePercentage}%`,
-                    }}
-                  />
-
-                </div>
-
+              <div className={`confidence-panel screening-${screeningTone}`}>
+                <div className="confidence-top"><span>SCREENING INDICATOR</span><strong>{result.myeloblast_like_proportion.toFixed(1)}%</strong></div>
+                <div className="confidence-bar"><div style={{ width: `${Math.min(result.myeloblast_like_proportion, 100)}%` }} /></div>
                 <div className="confidence-bottom">
-
-                  <span>
-                    Model certainty
-                  </span>
-
-                  <strong>
-                    {getConfidenceLabel()}
-                  </strong>
-
+                  <span>Candidate-cell burden</span>
+                  <strong>{result.screening_level === "ELEVATED_SCREENING_INDICATOR" ? "Elevated" : result.myeloblast_like_cells ? "Flagged" : "Lower"}</strong>
                 </div>
-
               </div>
-
             </div>
 
-            {/* =================================================
-                EXPLAINABLE AI
-            ================================================== */}
-
-            <section className="xai-section">
-
-              <div className="xai-heading">
-
-                <div>
-
-                  <div className="section-eyebrow">
-                    EXPLAINABLE AI
-                  </div>
-
-                  <h2>
-                    Where did the model look?
-                  </h2>
-
-                  <p>
-                    Grad-CAM visualizes regions that
-                    contributed to the model's selected
-                    classification.
-                  </p>
-
+            <section className="information-section">
+              <div className="info-card cell-card">
+                <div className="info-card-heading">
+                  <div className="info-icon">◉</div>
+                  <div><span className="section-eyebrow">SEGMENTATION</span><h3>Cellpose Results</h3></div>
                 </div>
-
-                <div className="xai-method">
-                  <span>METHOD</span>
-                  Grad-CAM
+                <p>
+                  The whole smear was segmented first. Only candidates with a
+                  purple/blue score ≥ {result ? 35 : 35} were used for the
+                  notebook-style nucleated-cell screening summary.
+                </p>
+                <div className="file-meta">
+                  <div><span>OBJECTS</span><strong>{result.cellpose_objects}</strong></div>
+                  <div><span>CANDIDATES</span><strong>{result.candidate_cells}</strong></div>
                 </div>
-
               </div>
 
-              {/* =================================================
-                  MAIN VISUALIZATION
-              ================================================== */}
+              <div className="info-card probabilities-card">
+                <div className="info-card-heading">
+                  <div className="info-icon">≡</div>
+                  <div><span className="section-eyebrow">CANDIDATE DISTRIBUTION</span><h3>Cell Classes</h3></div>
+                </div>
+                <div className="probability-list">
+                  {Object.entries(result.class_distribution || {}).sort(([, a], [, b]) => b - a).map(([name, count]) => {
+                    const percentage = result.candidate_cells ? (count / result.candidate_cells) * 100 : 0;
+                    return (
+                      <div className="probability-item" key={name}>
+                        <div className="probability-top"><span>{formatClassName(name)}</span><strong>{count} · {percentage.toFixed(1)}%</strong></div>
+                        <div className="probability-track"><div style={{ width: `${Math.max(percentage, count ? 0.5 : 0)}%` }} /></div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+
+            <section className="xai-section">
+              <div className="xai-heading">
+                <div>
+                  <div className="section-eyebrow">EXPLAINABLE AI</div>
+                  <h2>Cellpose → Grad-CAM → SHAP</h2>
+                  <p>Inspect the whole-smear classification map and the strongest myeloblast-like candidate explanations.</p>
+                </div>
+                <div className="xai-method"><span>VLM</span>{result.vlm_model}</div>
+              </div>
 
               <div className="xai-workspace">
-
                 <div className="visual-main">
-
                   <div className="visual-toolbar">
-
                     <div className="view-tabs">
-
-                      <button
-                        className={
-                          viewMode === "original"
-                            ? "active"
-                            : ""
-                        }
-                        onClick={() =>
-                          setViewMode("original")
-                        }
-                      >
-                        Original
-                      </button>
-
-                      <button
-                        className={
-                          viewMode === "heatmap"
-                            ? "active"
-                            : ""
-                        }
-                        onClick={() =>
-                          setViewMode("heatmap")
-                        }
-                      >
-                        Heatmap
-                      </button>
-
-                      <button
-                        className={
-                          viewMode === "overlay"
-                            ? "active"
-                            : ""
-                        }
-                        onClick={() =>
-                          setViewMode("overlay")
-                        }
-                      >
-                        Overlay
-                      </button>
-
+                      <button className={viewMode === "original" ? "active" : ""} onClick={() => setViewMode("original")}>Original</button>
+                      <button className={viewMode === "overlay" ? "active" : ""} onClick={() => setViewMode("overlay")}>Cell map</button>
+                      <button className={viewMode === "gradcam" ? "active" : ""} onClick={() => setViewMode("gradcam")}>Grad-CAM</button>
+                      <button className={viewMode === "shap" ? "active" : ""} onClick={() => setViewMode("shap")}>SHAP</button>
                     </div>
-
-                    <span className="resolution">
-                      224 × 224
-                    </span>
-
+                    <span className="resolution">384 × 384 cells</span>
                   </div>
 
                   <div className="main-image-frame">
-
-                    {viewMode === "original" && (
-
-                      <img
-                        src={preview}
-                        alt="Original microscopy image"
-                      />
-
+                    {viewMode === "original" && <img src={result.originalUrl || preview} alt="Original blood smear" />}
+                    {viewMode === "overlay" && result.overlayUrl && <img src={result.overlayUrl} alt="Cell classification overlay" />}
+                    {viewMode === "gradcam" && selectedGradcam && <img src={selectedGradcam.image_url} alt="Grad-CAM explanation" />}
+                    {viewMode === "shap" && selectedShap && <img src={selectedShap.image_url} alt="SHAP explanation" />}
+                    {viewMode !== "original" && viewMode !== "overlay" && !selectedGradcam && !selectedShap && (
+                      <div className="visual-error">No XAI image was generated for this analysis.</div>
                     )}
-
-                    {viewMode === "heatmap" && (
-
-                      gradcamHeatmap ? (
-
-                        <img
-                          src={gradcamHeatmap}
-                          alt="Grad-CAM heatmap"
-                        />
-
-                      ) : (
-
-                        <div className="visual-error">
-                          Heatmap unavailable
-                        </div>
-
-                      )
-
-                    )}
-
-                    {viewMode === "overlay" && (
-
-                      gradcamOverlay ? (
-
-                        <img
-                          src={gradcamOverlay}
-                          alt="Grad-CAM overlay"
-                          style={{
-                            opacity:
-                              0.65 +
-                              heatmapOpacity * 0.35,
-                          }}
-                        />
-
-                      ) : (
-
-                        <div className="visual-error">
-                          Grad-CAM unavailable
-                        </div>
-
-                      )
-
-                    )}
-
-                    <div className="image-corner top-left"></div>
-                    <div className="image-corner top-right"></div>
-                    <div className="image-corner bottom-left"></div>
-                    <div className="image-corner bottom-right"></div>
-
+                    {viewMode === "overlay" && !result.overlayUrl && <div className="visual-error">Classification overlay unavailable.</div>}
+                    <div className="image-corner top-left"></div><div className="image-corner top-right"></div><div className="image-corner bottom-left"></div><div className="image-corner bottom-right"></div>
                   </div>
 
                   <div className="visual-caption">
-
-                    <div>
-
-                      <span className="caption-dot"></span>
-
-                      <strong>
-                        {viewMode === "original"
-                          ? "Original specimen"
-                          : viewMode === "heatmap"
-                          ? "Activation intensity"
-                          : "Grad-CAM overlay"}
-                      </strong>
-
-                    </div>
-
-                    <span>
-                      {viewMode === "heatmap"
-                        ? "Blue → Red = increasing activation"
-                        : "Regions highlighted by model activation"}
-                    </span>
-
+                    <div><span className="caption-dot"></span><strong>{viewMode === "original" ? "Original smear" : viewMode === "overlay" ? "Cell classification map" : viewMode === "gradcam" ? "Grad-CAM evidence" : "SHAP attribution"}</strong></div>
+                    <span>{viewMode === "overlay" ? "Candidate labels are generated after Cellpose segmentation" : "Model explanation — not a clinical finding"}</span>
                   </div>
-
                 </div>
 
-                {/* =================================================
-                    VISUAL SIDE PANEL
-                ================================================== */}
-
                 <aside className="visual-sidebar">
-
                   <div className="sidebar-block">
-
-                    <span className="sidebar-label">
-                      VISUALIZATION
-                    </span>
-
-                    <h3>
-                      Grad-CAM
-                    </h3>
-
-                    <p>
-                      Warmer colors represent stronger
-                      model activation toward the selected
-                      class.
-                    </p>
-
+                    <span className="sidebar-label">SELECTED XAI CELL</span>
+                    <h3>{selectedGradcam ? `Cell ${selectedGradcam.cell_id}` : "None"}</h3>
+                    <p>{selectedGradcam ? `${formatClassName(selectedGradcam.class)} · ${(selectedGradcam.confidence * 100).toFixed(1)}%` : "No myeloblast-like candidate was selected."}</p>
                   </div>
 
                   <div className="legend-block">
-
-                    <span className="sidebar-label">
-                      ACTIVATION SCALE
-                    </span>
-
-                    <div className="gradient-vertical"></div>
-
-                    <div className="gradient-labels">
-                      <span>High</span>
-                      <span>Low</span>
+                    <span className="sidebar-label">TOP MYELOBLAST-LIKE CELLS</span>
+                    <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
+                      {result.gradcamRecords.map((item) => (
+                        <button
+                          key={item.cell_id}
+                          onClick={() => { setSelectedXaiCell(item.cell_id); setViewMode("gradcam"); }}
+                          style={{
+                            textAlign: "left",
+                            border: item.cell_id === selectedXaiCell ? "2px solid #333" : "1px solid #ddd",
+                            background: "white",
+                            padding: "8px 10px",
+                            borderRadius: 8,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Cell {item.cell_id} — {formatClassName(item.class)} ({(item.confidence * 100).toFixed(1)}%)
+                        </button>
+                      ))}
                     </div>
-
-                  </div>
-
-                  <div className="slider-block">
-
-                    <div className="slider-title">
-
-                      <span>
-                        Overlay intensity
-                      </span>
-
-                      <strong>
-                        {Math.round(
-                          heatmapOpacity * 100
-                        )}
-                        %
-                      </strong>
-
-                    </div>
-
-                    <input
-                      type="range"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={heatmapOpacity}
-                      onChange={(event) =>
-                        setHeatmapOpacity(
-                          Number(
-                            event.target.value
-                          )
-                        )
-                      }
-                    />
-
-                    <div className="slider-range">
-                      <span>Subtle</span>
-                      <span>Strong</span>
-                    </div>
-
                   </div>
 
                   <div className="xai-note">
-
-                    <div className="xai-note-icon">
-                      i
-                    </div>
-
+                    <div className="xai-note-icon">i</div>
                     <p>
-                      Grad-CAM is an interpretability
-                      visualization. It shows model
-                      activation and should not be
-                      interpreted as a clinical finding.
+                      Grad-CAM and SHAP explain the classifier's behavior. They do
+                      not prove AML, leukemia, cancer, or a specific biological structure.
                     </p>
-
                   </div>
-
                 </aside>
-
               </div>
-
-              {/* =================================================
-                  COMPARISON CARDS
-              ================================================== */}
-
-              <div className="comparison-grid">
-
-                <div className="comparison-card">
-
-                  <div className="comparison-header">
-
-                    <span>A</span>
-
-                    <div>
-                      <strong>
-                        Original
-                      </strong>
-
-                      <small>
-                        Input specimen
-                      </small>
-                    </div>
-
-                  </div>
-
-                  <div className="comparison-image">
-
-                    <img
-                      src={preview}
-                      alt="Original specimen"
-                    />
-
-                  </div>
-
-                </div>
-
-                <div className="comparison-card featured">
-
-                  <div className="comparison-header">
-
-                    <span>B</span>
-
-                    <div>
-                      <strong>
-                        Grad-CAM
-                      </strong>
-
-                      <small>
-                        Model attention overlay
-                      </small>
-                    </div>
-
-                  </div>
-
-                  <div className="comparison-image">
-
-                    {gradcamOverlay ? (
-
-                      <img
-                        src={gradcamOverlay}
-                        alt="Grad-CAM overlay"
-                      />
-
-                    ) : (
-
-                      <div className="visual-error">
-                        Unavailable
-                      </div>
-
-                    )}
-
-                  </div>
-
-                </div>
-
-                <div className="comparison-card">
-
-                  <div className="comparison-header">
-
-                    <span>C</span>
-
-                    <div>
-                      <strong>
-                        Heatmap
-                      </strong>
-
-                      <small>
-                        Activation map
-                      </small>
-                    </div>
-
-                  </div>
-
-                  <div className="comparison-image">
-
-                    {gradcamHeatmap ? (
-
-                      <img
-                        src={gradcamHeatmap}
-                        alt="Activation heatmap"
-                      />
-
-                    ) : (
-
-                      <div className="visual-error">
-                        Unavailable
-                      </div>
-
-                    )}
-
-                  </div>
-
-                </div>
-
-              </div>
-
             </section>
-
-            {/* =================================================
-                CELL INFORMATION
-            ================================================== */}
 
             <section className="information-section">
-
               <div className="info-card cell-card">
-
                 <div className="info-card-heading">
-
-                  <div className="info-icon">
-                    ◉
-                  </div>
-
-                  <div>
-
-                    <span className="section-eyebrow">
-                      CELL PROFILE
-                    </span>
-
-                    <h3>
-                      {predictedInfo?.title ||
-                        formatClassName(
-                          result.prediction
-                        )}
-                    </h3>
-
-                  </div>
-
+                  <div className="info-icon">AI</div>
+                  <div><span className="section-eyebrow">REPORT GENERATION</span><h3>Hugging Face VLM</h3></div>
                 </div>
-
                 <p>
-                  {predictedInfo?.description ||
-                    "The model identified this cell based on learned microscopic image features."}
+                  The PDF report uses the configured Hugging Face vision-language
+                  model to produce conservative explanations for selected cell
+                  evidence. If HF inference is unavailable, the report falls back
+                  to deterministic model-output explanations.
                 </p>
-
+                <strong>{result.vlm_enabled ? "VLM explanation enabled" : "VLM token not configured — fallback explanations used"}</strong>
               </div>
-
-              {/* =================================================
-                  PROBABILITIES
-              ================================================== */}
 
               <div className="info-card probabilities-card">
-
                 <div className="info-card-heading">
-
-                  <div className="info-icon">
-                    ≡
-                  </div>
-
-                  <div>
-
-                    <span className="section-eyebrow">
-                      MODEL OUTPUT
-                    </span>
-
-                    <h3>
-                      Class Probabilities
-                    </h3>
-
-                  </div>
-
+                  <div className="info-icon">PDF</div>
+                  <div><span className="section-eyebrow">FINAL REPORT</span><h3>Download Analysis</h3></div>
                 </div>
-
-                <div className="probability-list">
-
-                  {Object.entries(
-                    result.probabilities || {}
-                  )
-                    .sort(
-                      ([, a], [, b]) =>
-                        b - a
-                    )
-                    .map(
-                      ([name, probability]) => {
-
-                        const percentage =
-                          Math.min(
-                            Math.max(
-                              probability * 100,
-                              0
-                            ),
-                            100
-                          );
-
-                        const predicted =
-                          name ===
-                          result.prediction;
-
-                        return (
-
-                          <div
-                            className={`probability-item ${
-                              predicted
-                                ? "predicted"
-                                : ""
-                            }`}
-                            key={name}
-                          >
-
-                            <div className="probability-top">
-
-                              <span>
-
-                                {predicted && (
-                                  <b className="mini-check">
-                                    ✓
-                                  </b>
-                                )}
-
-                                {formatClassName(
-                                  name
-                                )}
-
-                              </span>
-
-                              <strong>
-                                {percentage.toFixed(2)}%
-                              </strong>
-
-                            </div>
-
-                            <div className="probability-track">
-
-                              <div
-                                style={{
-                                  width: `${Math.max(
-                                    percentage,
-                                    percentage > 0
-                                      ? 0.4
-                                      : 0
-                                  )}%`,
-                                }}
-                              />
-
-                            </div>
-
-                          </div>
-
-                        );
-                      }
-                    )}
-
-                </div>
-
+                <p>Includes segmentation summary, candidate table, classification overlay, Grad-CAM, SHAP and limitations.</p>
+                {result.reportUrl && (
+                  <a className="primary-button" href={result.reportUrl} target="_blank" rel="noreferrer" style={{ display: "inline-flex", textDecoration: "none" }}>
+                    Open PDF report →
+                  </a>
+                )}
               </div>
-
             </section>
 
-            {/* =================================================
-                DISCLAIMER
-            ================================================== */}
-
             <div className="research-disclaimer">
-
-              <div className="disclaimer-icon">
-                !
-              </div>
-
+              <div className="disclaimer-icon">!</div>
               <div>
-
-                <strong>
-                  Research & Educational Use
-                </strong>
-
+                <strong>Research / screening support only</strong>
                 <p>
-                  SynthMicro is an AI-assisted research
-                  and educational application. Model
-                  predictions, confidence values and
-                  Grad-CAM visualizations are not clinical
-                  diagnoses and should not replace evaluation
-                  by a qualified healthcare professional.
+                  This pipeline is not a clinical cancer detector. A high
+                  myeloblast-like proportion is a screening indicator for further
+                  review, not a diagnosis. The model is a five-class closed-set
+                  classifier and does not contain an explicit RBC/unknown class.
+                  Clinical interpretation must be performed by qualified professionals.
                 </p>
-
               </div>
-
             </div>
-
           </section>
-
         )}
-
       </main>
 
-      {/* =====================================================
-          FOOTER
-      ====================================================== */}
-
       <footer className="footer">
-
         <div className="footer-inner">
-
-          <div>
-            <strong>
-              SynthMicro
-            </strong>
-
-            <span>
-              Explainable AI for microscopic cell analysis
-            </span>
-          </div>
-
-          <div className="footer-tech">
-            ResNet50
-            <span>•</span>
-            Grad-CAM
-            <span>•</span>
-            FastAPI
-          </div>
-
+          <div><strong>SynthMicro</strong><span>Explainable whole-smear blood-cell analysis</span></div>
+          <div className="footer-tech">Cellpose <span>•</span> ResNet50 <span>•</span> Grad-CAM <span>•</span> SHAP <span>•</span> Hugging Face</div>
         </div>
-
       </footer>
-
     </div>
   );
 }
