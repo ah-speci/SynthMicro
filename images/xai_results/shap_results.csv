@@ -1,0 +1,7 @@
+cell_id,class,confidence,path
+65,myeloblast,0.9327551126480103,../images/xai_results/cell_65_shap.png
+33,myeloblast,0.9046623110771179,../images/xai_results/cell_33_shap.png
+4,myeloblast,0.9037834405899048,../images/xai_results/cell_4_shap.png
+31,myeloblast,0.8918981552124023,../images/xai_results/cell_31_shap.png
+52,myeloblast,0.8753060102462769,../images/xai_results/cell_52_shap.png
+1,myeloblast,0.7750183343887329,../images/xai_results/cell_1_shap.png
