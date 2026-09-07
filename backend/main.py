@@ -1,28 +1,35 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import io
+import os
+import base64
+import uuid
+import sqlite3
 
-import tensorflow as tf
+from pathlib import Path
+from datetime import datetime
+
+import cv2
 import numpy as np
+import tensorflow as tf
 
 from PIL import Image
-import io
-import base64
-from pathlib import Path
+
+from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 
 
 # ============================================================
-# 1. Create FastAPI application
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
     title="SynthMicro API",
-    description="Leukemia cell classification and Grad-CAM XAI API",
+    description="AI-powered microscopic blood-cell classification with Grad-CAM",
     version="1.0.0"
 )
 
 
 # ============================================================
-# 2. Allow frontend to communicate with backend
+# CORS
 # ============================================================
 
 app.add_middleware(
@@ -35,25 +42,45 @@ app.add_middleware(
 
 
 # ============================================================
-# 3. Load model
+# PROJECT PATHS
 # ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# main.py:
+# C:\Users\Sunny\SynthMicro\backend\main.py
+#
+# BASE_DIR:
+# C:\Users\Sunny\SynthMicro
 
-MODEL_PATH = PROJECT_ROOT / "models" / "resnet50_best.keras"
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-print("Loading model...")
+MODEL_PATH = BASE_DIR / "models" / "resnet50_best.keras"
 
-model = tf.keras.models.load_model(MODEL_PATH)
+UPLOAD_DIR = BASE_DIR / "uploads"
 
-print("Model loaded successfully")
+XAI_DIR = BASE_DIR / "xai_results"
+
+DB_PATH = BASE_DIR / "synthmicro.db"
+
+
+# Create required directories
+UPLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+XAI_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
 
 
 # ============================================================
-# 4. Class names
+# MODEL CONFIGURATION
 # ============================================================
 
-class_names = [
+IMG_SIZE = (224, 224)
+
+CLASS_NAMES = [
     "basophil",
     "erythroblast",
     "monocyte",
@@ -63,176 +90,84 @@ class_names = [
 
 
 # ============================================================
-# 5. Get ResNet50 base model
+# DATABASE
 # ============================================================
 
-base_model = model.get_layer("resnet50")
+def init_db():
 
-last_conv_layer = base_model.get_layer(
-    "conv5_block3_out"
+    conn = sqlite3.connect(
+        str(DB_PATH)
+    )
+
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analyses (
+            id TEXT PRIMARY KEY,
+            prediction TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            image_path TEXT,
+            heatmap_path TEXT,
+            xai_path TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# Initialize database
+init_db()
+
+
+# ============================================================
+# LOAD MODEL
+# ============================================================
+
+print("=" * 60)
+print("SynthMicro")
+print("Loading model...")
+print("=" * 60)
+
+print(f"Model path: {MODEL_PATH}")
+
+
+if not MODEL_PATH.exists():
+
+    raise FileNotFoundError(
+        f"Model file not found: {MODEL_PATH}"
+    )
+
+
+model = tf.keras.models.load_model(
+    MODEL_PATH,
+    compile=False
 )
 
-print("Grad-CAM layer found")
+
+print("Model loaded successfully.")
+
+print(
+    "Model layers:",
+    [layer.name for layer in model.layers]
+)
+
+print("=" * 60)
 
 
 # ============================================================
-# 6. Health check
+# IMAGE → BASE64
 # ============================================================
 
-@app.get("/")
-def root():
-    return {
-        "message": "SynthMicro API is running"
-    }
+def image_to_base64(
+    image: Image.Image
+) -> str:
 
-
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "model": "resnet50_best.keras"
-    }
-
-
-# ============================================================
-# 7. Grad-CAM generation
-# ============================================================
-
-def generate_gradcam(input_tensor):
     """
-    Generate Grad-CAM for the predicted class.
-    """
-
-    with tf.GradientTape() as tape:
-
-        # Get convolutional feature maps
-        conv_outputs = base_model(
-            input_tensor,
-            training=False
-        )
-
-        tape.watch(conv_outputs)
-
-        # Pass feature maps through classifier
-        x = conv_outputs
-
-        for layer in model.layers[1:]:
-            x = layer(
-                x,
-                training=False
-            )
-
-        predictions = x
-
-        # Find predicted class
-        predicted_index = tf.argmax(
-            predictions[0]
-        )
-
-        class_output = predictions[
-            :,
-            predicted_index
-        ]
-
-    # Calculate gradients
-    grads = tape.gradient(
-        class_output,
-        conv_outputs
-    )
-
-    # Average gradients
-    weights = tf.reduce_mean(
-        grads,
-        axis=(1, 2)
-    )
-
-    # Weighted combination
-    cam = tf.reduce_sum(
-        conv_outputs *
-        weights[:, tf.newaxis, tf.newaxis, :],
-        axis=-1
-    )
-
-    # ReLU
-    cam = tf.maximum(cam, 0)
-
-    # Normalize
-    cam = cam / (
-        tf.reduce_max(
-            cam,
-            axis=(1, 2),
-            keepdims=True
-        ) + 1e-8
-    )
-
-    heatmap = cam[0].numpy()
-
-    # Resize heatmap to image size
-    heatmap = tf.image.resize(
-        heatmap[..., np.newaxis],
-        (224, 224)
-    ).numpy().squeeze()
-
-    return (
-        heatmap,
-        predictions[0].numpy(),
-        predicted_index.numpy()
-    )
-
-
-# ============================================================
-# 8. Create Grad-CAM overlay
-# ============================================================
-
-def create_overlay(original_image, heatmap):
-    """
-    Create a colored Grad-CAM overlay.
-    """
-
-    # Convert heatmap to 0-255
-    heatmap_uint8 = np.uint8(
-        255 * heatmap
-    )
-
-    # Create a simple RGB heatmap
-    heatmap_rgb = np.zeros(
-        (224, 224, 3),
-        dtype=np.uint8
-    )
-
-    # Red = high activation
-    heatmap_rgb[:, :, 0] = heatmap_uint8
-
-    # Blue = low activation
-    heatmap_rgb[:, :, 2] = 255 - heatmap_uint8
-
-    # Convert to PIL
-    heatmap_image = Image.fromarray(
-        heatmap_rgb
-    )
-
-    # Resize original
-    original_image = original_image.resize(
-        (224, 224)
-    ).convert("RGB")
-
-    # Blend original + heatmap
-    overlay = Image.blend(
-        original_image,
-        heatmap_image,
-        alpha=0.45
-    )
-
-    return overlay
-
-
-# ============================================================
-# 9. Convert PIL image to Base64
-# ============================================================
-
-def image_to_base64(image):
-    """
-    Convert image to Base64 so frontend can display it.
+    Convert a PIL image to PNG Base64.
     """
 
     buffer = io.BytesIO()
@@ -242,15 +177,484 @@ def image_to_base64(image):
         format="PNG"
     )
 
-    encoded = base64.b64encode(
+    return base64.b64encode(
         buffer.getvalue()
     ).decode("utf-8")
 
-    return encoded
+
+# ============================================================
+# IMAGE PREPROCESSING
+# ============================================================
+
+def preprocess_image(
+    image: Image.Image
+):
+    """
+    Prepare image for SynthMicro ResNet50.
+
+    IMPORTANT:
+
+    The SynthMicro model was trained using raw pixel values.
+
+    Therefore:
+        - Do NOT divide by 255
+        - Do NOT use preprocess_input()
+    """
+
+    image = image.convert("RGB")
+
+    image = image.resize(
+        IMG_SIZE
+    )
+
+    image_array = np.array(
+        image,
+        dtype=np.float32
+    )
+
+    image_array = np.expand_dims(
+        image_array,
+        axis=0
+    )
+
+    return image_array
 
 
 # ============================================================
-# 10. Prediction endpoint
+# GRAD-CAM
+# ============================================================
+
+def make_gradcam_heatmap(img_array, model):
+    """
+    Generate a localized Grad-CAM heatmap for the
+    class predicted by the ResNet50 model.
+
+    Final convolutional layer:
+        conv5_block3_out
+    """
+
+    # --------------------------------------------------------
+    # Get nested ResNet50
+    # --------------------------------------------------------
+
+    base_model = model.get_layer("resnet50")
+
+    last_conv_layer = base_model.get_layer(
+        "conv5_block3_out"
+    )
+
+    # --------------------------------------------------------
+    # Build Grad-CAM model
+    # --------------------------------------------------------
+
+    grad_model = tf.keras.models.Model(
+        inputs=base_model.inputs,
+        outputs=[
+            last_conv_layer.output,
+            base_model.output
+        ]
+    )
+
+    # --------------------------------------------------------
+    # Forward pass
+    # --------------------------------------------------------
+
+    with tf.GradientTape() as tape:
+
+        conv_outputs, features = grad_model(
+            img_array,
+            training=False
+        )
+
+        # Classification head
+        x = features
+
+        for layer in model.layers[1:]:
+
+            x = layer(
+                x,
+                training=False
+            )
+
+        predictions = x
+
+        # Predicted class
+        pred_index = tf.argmax(
+            predictions[0]
+        )
+
+        class_channel = predictions[
+            :,
+            pred_index
+        ]
+
+    # --------------------------------------------------------
+    # Gradients
+    # --------------------------------------------------------
+
+    grads = tape.gradient(
+        class_channel,
+        conv_outputs
+    )
+
+    if grads is None:
+
+        raise ValueError(
+            "Could not calculate Grad-CAM gradients."
+        )
+
+    # --------------------------------------------------------
+    # Global average pooling
+    # --------------------------------------------------------
+
+    pooled_grads = tf.reduce_mean(
+        grads,
+        axis=(0, 1, 2)
+    )
+
+    # --------------------------------------------------------
+    # Remove batch dimension
+    # --------------------------------------------------------
+
+    conv_outputs = conv_outputs[0]
+
+    # --------------------------------------------------------
+    # Weighted feature maps
+    # --------------------------------------------------------
+
+    heatmap = tf.reduce_sum(
+        conv_outputs * pooled_grads,
+        axis=-1
+    )
+
+    # --------------------------------------------------------
+    # ReLU
+    # --------------------------------------------------------
+
+    heatmap = tf.maximum(
+        heatmap,
+        0
+    )
+
+    heatmap = heatmap.numpy()
+
+    # --------------------------------------------------------
+    # Normalize
+    # --------------------------------------------------------
+
+    heatmap_min = np.min(heatmap)
+    heatmap_max = np.max(heatmap)
+
+    if heatmap_max <= heatmap_min:
+
+        return np.zeros_like(
+            heatmap,
+            dtype=np.float32
+        )
+
+    heatmap = (
+        heatmap - heatmap_min
+    ) / (
+        heatmap_max - heatmap_min
+    )
+
+    # ========================================================
+    # IMPORTANT:
+    # Suppress weak activation
+    # ========================================================
+
+    threshold = np.percentile(
+        heatmap,
+        60
+    )
+
+    heatmap[heatmap < threshold] = 0
+
+    # --------------------------------------------------------
+    # Re-normalize after thresholding
+    # --------------------------------------------------------
+
+    max_value = np.max(heatmap)
+
+    if max_value > 0:
+
+        heatmap = heatmap / max_value
+
+    # --------------------------------------------------------
+    # Slight smoothing
+    #
+    # Don't over-blur because we want the activation
+    # to remain localized around the cell.
+    # --------------------------------------------------------
+
+    heatmap = cv2.GaussianBlur(
+        heatmap,
+        (0, 0),
+        sigmaX=1.0
+    )
+
+    # --------------------------------------------------------
+    # Final normalization
+    # --------------------------------------------------------
+
+    heatmap_min = np.min(heatmap)
+    heatmap_max = np.max(heatmap)
+
+    if heatmap_max > heatmap_min:
+
+        heatmap = (
+            heatmap - heatmap_min
+        ) / (
+            heatmap_max - heatmap_min
+        )
+
+    return heatmap.astype(
+        np.float32
+    )
+# ============================================================
+# CREATE JET HEATMAP
+# ============================================================
+
+def create_heatmap_image(
+    heatmap,
+    analysis_id
+):
+    """
+    Convert Grad-CAM values into a JET heatmap.
+
+    Color scale:
+
+        Blue   = low activation
+        Cyan   = low/medium activation
+        Green  = medium activation
+        Yellow = high activation
+        Red    = strongest activation
+    """
+
+    # --------------------------------------------------------
+    # Resize heatmap
+    # --------------------------------------------------------
+
+    heatmap_resized = cv2.resize(
+        heatmap,
+        IMG_SIZE,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    # --------------------------------------------------------
+    # Convert 0-1 → 0-255
+    # --------------------------------------------------------
+
+    heatmap_uint8 = np.uint8(
+        255 * heatmap_resized
+    )
+
+    # --------------------------------------------------------
+    # Apply JET
+    # --------------------------------------------------------
+
+    heatmap_color = cv2.applyColorMap(
+        heatmap_uint8,
+        cv2.COLORMAP_JET
+    )
+
+    # --------------------------------------------------------
+    # OpenCV BGR → RGB
+    # --------------------------------------------------------
+
+    heatmap_rgb = cv2.cvtColor(
+        heatmap_color,
+        cv2.COLOR_BGR2RGB
+    )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    heatmap_filename = (
+        f"{analysis_id}_heatmap.png"
+    )
+
+    heatmap_path = (
+        XAI_DIR / heatmap_filename
+    )
+
+    Image.fromarray(
+        heatmap_rgb
+    ).save(
+        heatmap_path
+    )
+
+    # --------------------------------------------------------
+    # Base64
+    # --------------------------------------------------------
+
+    heatmap_base64 = image_to_base64(
+        Image.fromarray(
+            heatmap_rgb
+        )
+    )
+
+    return (
+        heatmap_base64,
+        str(heatmap_path)
+    )
+
+
+# ============================================================
+# CREATE GRAD-CAM OVERLAY
+# ============================================================
+
+def create_overlay(
+    original_pil,
+    heatmap,
+    analysis_id
+):
+    """
+    Create the final Grad-CAM visualization.
+
+    The original microscopy image remains visible while
+    the Grad-CAM activation is displayed over it.
+
+    Original image:
+        60%
+
+    Grad-CAM:
+        40%
+    """
+
+    # --------------------------------------------------------
+    # Resize original image
+    # --------------------------------------------------------
+
+    original = (
+        original_pil
+        .convert("RGB")
+        .resize(
+            IMG_SIZE,
+            Image.Resampling.BICUBIC
+        )
+    )
+
+    original_rgb = np.array(
+        original,
+        dtype=np.uint8
+    )
+
+    # --------------------------------------------------------
+    # Resize Grad-CAM
+    # --------------------------------------------------------
+
+    heatmap_resized = cv2.resize(
+        heatmap,
+        IMG_SIZE,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    # --------------------------------------------------------
+    # Convert Grad-CAM 0-1 → 0-255
+    # --------------------------------------------------------
+
+    heatmap_uint8 = np.uint8(
+        255 * heatmap_resized
+    )
+
+    # --------------------------------------------------------
+    # Apply JET colormap
+    # --------------------------------------------------------
+
+    heatmap_color_bgr = cv2.applyColorMap(
+        heatmap_uint8,
+        cv2.COLORMAP_JET
+    )
+
+    # --------------------------------------------------------
+    # Convert heatmap BGR → RGB
+    # --------------------------------------------------------
+
+    heatmap_color_rgb = cv2.cvtColor(
+        heatmap_color_bgr,
+        cv2.COLOR_BGR2RGB
+    )
+
+    # --------------------------------------------------------
+    # Create overlay
+    # --------------------------------------------------------
+
+    overlay = cv2.addWeighted(
+        original_rgb,
+        0.60,
+        heatmap_color_rgb,
+        0.40,
+        0
+    )
+
+    # --------------------------------------------------------
+    # Save overlay
+    # --------------------------------------------------------
+
+    xai_filename = (
+        f"{analysis_id}_xai.png"
+    )
+
+    xai_path = (
+        XAI_DIR / xai_filename
+    )
+
+    Image.fromarray(
+        overlay
+    ).save(
+        xai_path
+    )
+
+    # --------------------------------------------------------
+    # Convert overlay to Base64
+    # --------------------------------------------------------
+
+    overlay_image = Image.fromarray(
+        overlay
+    )
+
+    overlay_base64 = image_to_base64(
+        overlay_image
+    )
+
+    return (
+        overlay_base64,
+        str(xai_path)
+    )
+
+# ============================================================
+# ROOT ENDPOINT
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "status": "running",
+        "message": "SynthMicro API is running",
+        "model": "resnet50_best.keras",
+        "classes": CLASS_NAMES
+    }
+
+
+# ============================================================
+# HEALTH ENDPOINT
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "healthy",
+        "model": "resnet50_best.keras",
+        "classes": CLASS_NAMES
+    }
+
+
+# ============================================================
+# PREDICTION ENDPOINT
 # ============================================================
 
 @app.post("/predict")
@@ -258,122 +662,468 @@ async def predict(
     file: UploadFile = File(...)
 ):
 
-    # ---------------------------------------------
-    # Check file type
-    # ---------------------------------------------
+    # --------------------------------------------------------
+    # Validate file
+    # --------------------------------------------------------
 
-    if not file.content_type or not file.content_type.startswith(
-        "image/"
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Please upload an image file."
-        )
+    allowed_types = {
+        "image/jpeg",
+        "image/jpg",
+        "image/png"
+    }
+
+    if file.content_type not in allowed_types:
+
+        return {
+            "success": False,
+            "error": (
+                "Please upload a JPG, JPEG, "
+                "or PNG image."
+            )
+        }
+
 
     try:
 
-        # -----------------------------------------
-        # Read uploaded image
-        # -----------------------------------------
+        # ====================================================
+        # READ IMAGE
+        # ====================================================
 
         contents = await file.read()
+
+        if not contents:
+
+            return {
+                "success": False,
+                "error": "Uploaded file is empty."
+            }
+
 
         image = Image.open(
             io.BytesIO(contents)
         ).convert("RGB")
 
-        # -----------------------------------------
-        # Resize to model input size
-        # -----------------------------------------
 
-        resized_image = image.resize(
-            (224, 224)
+        # Keep original
+        original_image = image.copy()
+
+
+        # ====================================================
+        # GENERATE ANALYSIS ID
+        # ====================================================
+
+        analysis_id = uuid.uuid4().hex
+
+
+        # ====================================================
+        # SAVE ORIGINAL IMAGE
+        # ====================================================
+
+        upload_filename = (
+            f"{analysis_id}.png"
         )
 
-        # -----------------------------------------
-        # Convert to NumPy
+        upload_path = (
+            UPLOAD_DIR / upload_filename
+        )
+
+        original_image.save(
+            upload_path
+        )
+
+
+        # ====================================================
+        # PREPROCESS
+        # ====================================================
+
+        input_array = preprocess_image(
+            original_image
+        )
+
+
+        # ====================================================
+        # MODEL PREDICTION
+        # ====================================================
+
+        predictions = model.predict(
+            input_array,
+            verbose=0
+        )
+
+
+        probabilities = predictions[0]
+
+
+        # ====================================================
+        # FIND PREDICTED CLASS
+        # ====================================================
+
+        predicted_index = int(
+            np.argmax(probabilities)
+        )
+
+        predicted_label = (
+            CLASS_NAMES[predicted_index]
+        )
+
+
+        # ====================================================
+        # CONFIDENCE
         #
-        # IMPORTANT:
-        # No /255.0 here.
-        # This matches model training.
-        # -----------------------------------------
-
-        img_array = np.array(
-            resized_image,
-            dtype=np.float32
-        )
-
-        input_tensor = tf.expand_dims(
-            img_array,
-            axis=0
-        )
-
-        # -----------------------------------------
-        # Generate prediction + Grad-CAM
-        # -----------------------------------------
-
-        heatmap, probabilities, predicted_index = generate_gradcam(
-            input_tensor
-        )
-
-        # -----------------------------------------
-        # Prediction details
-        # -----------------------------------------
-
-        predicted_class = class_names[
-            predicted_index
-        ]
+        # Returned as 0-1 because your React frontend
+        # converts it to percentage.
+        # ====================================================
 
         confidence = float(
-            probabilities[predicted_index] * 100
+            probabilities[predicted_index]
         )
 
-        # -----------------------------------------
-        # All class probabilities
-        # -----------------------------------------
 
-        probability_dict = {}
+        # ====================================================
+        # ALL CLASS PROBABILITIES
+        #
+        # Also returned as 0-1.
+        # ====================================================
 
-        for name, probability in zip(
-            class_names,
-            probabilities
-        ):
-            probability_dict[name] = float(
-                probability * 100
+        probability_dict = {
+
+            CLASS_NAMES[i]:
+                float(probabilities[i])
+
+            for i in range(
+                len(CLASS_NAMES)
             )
+        }
 
-        # -----------------------------------------
-        # Create Grad-CAM overlay
-        # -----------------------------------------
 
-        overlay = create_overlay(
-            resized_image,
-            heatmap
+        # ====================================================
+        # GRAD-CAM
+        # ====================================================
+
+        heatmap = make_gradcam_heatmap(
+            input_array,
+            model
         )
 
-        # -----------------------------------------
-        # Convert overlay to Base64
-        # -----------------------------------------
 
-        overlay_base64 = image_to_base64(
-            overlay
+        # ====================================================
+        # CREATE STANDALONE HEATMAP
+        # ====================================================
+
+        heatmap_base64, heatmap_path = (
+            create_heatmap_image(
+                heatmap,
+                analysis_id
+            )
         )
 
-        # -----------------------------------------
-        # Return response
-        # -----------------------------------------
+
+        # ====================================================
+        # CREATE OVERLAY
+        # ====================================================
+
+        overlay_base64, xai_path = (
+            create_overlay(
+                original_image,
+                heatmap,
+                analysis_id
+            )
+        )
+
+
+        # ====================================================
+        # SAVE DATABASE RECORD
+        # ====================================================
+
+        conn = sqlite3.connect(
+            str(DB_PATH)
+        )
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO analyses (
+                id,
+                prediction,
+                confidence,
+                image_path,
+                heatmap_path,
+                xai_path,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                analysis_id,
+
+                predicted_label,
+
+                round(
+                    confidence * 100,
+                    2
+                ),
+
+                str(upload_path),
+
+                heatmap_path,
+
+                xai_path,
+
+                datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+
+        # ====================================================
+        # RESPONSE
+        # ====================================================
 
         return {
+
             "success": True,
-            "prediction": predicted_class,
-            "confidence": confidence,
-            "probabilities": probability_dict,
-            "gradcam": overlay_base64
+
+            "analysis_id":
+                analysis_id,
+
+            "prediction":
+                predicted_label,
+
+            "confidence":
+                confidence,
+
+            "probabilities":
+                probability_dict,
+
+            # Existing frontend compatibility
+            "gradcam":
+                overlay_base64,
+
+            # Standalone heatmap
+            "gradcam_heatmap":
+                heatmap_base64,
+
+            # Overlay
+            "gradcam_overlay":
+                overlay_base64,
+
+            # Compatibility with older frontend
+            "xai_image":
+                f"data:image/png;base64,{overlay_base64}"
+
         }
+
 
     except Exception as e:
 
-        raise HTTPException(
-            status_code=500,
-            detail=str(e)
+        print(
+            "Prediction error:",
+            str(e)
         )
+
+        return {
+
+            "success": False,
+
+            "error":
+                str(e)
+
+        }
+
+
+# ============================================================
+# HISTORY ENDPOINT
+# ============================================================
+
+@app.get("/history")
+def history():
+
+    try:
+
+        conn = sqlite3.connect(
+            str(DB_PATH)
+        )
+
+        conn.row_factory = sqlite3.Row
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                prediction,
+                confidence,
+                image_path,
+                heatmap_path,
+                xai_path,
+                created_at
+            FROM analyses
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
+        )
+
+        rows = cursor.fetchall()
+
+        conn.close()
+
+
+        results = []
+
+
+        for row in rows:
+
+            # =================================================
+            # ORIGINAL IMAGE
+            # =================================================
+
+            image_base64 = None
+
+            if row["image_path"]:
+
+                image_path = Path(
+                    row["image_path"]
+                )
+
+                if image_path.exists():
+
+                    with open(
+                        image_path,
+                        "rb"
+                    ) as f:
+
+                        image_base64 = (
+                            "data:image/png;base64,"
+                            +
+                            base64.b64encode(
+                                f.read()
+                            ).decode("utf-8")
+                        )
+
+
+            # =================================================
+            # HEATMAP
+            # =================================================
+
+            heatmap_base64 = None
+
+            if row["heatmap_path"]:
+
+                heatmap_path = Path(
+                    row["heatmap_path"]
+                )
+
+                if heatmap_path.exists():
+
+                    with open(
+                        heatmap_path,
+                        "rb"
+                    ) as f:
+
+                        heatmap_base64 = (
+                            "data:image/png;base64,"
+                            +
+                            base64.b64encode(
+                                f.read()
+                            ).decode("utf-8")
+                        )
+
+
+            # =================================================
+            # OVERLAY
+            # =================================================
+
+            overlay_base64 = None
+
+            if row["xai_path"]:
+
+                xai_path = Path(
+                    row["xai_path"]
+                )
+
+                if xai_path.exists():
+
+                    with open(
+                        xai_path,
+                        "rb"
+                    ) as f:
+
+                        overlay_base64 = (
+                            "data:image/png;base64,"
+                            +
+                            base64.b64encode(
+                                f.read()
+                            ).decode("utf-8")
+                        )
+
+
+            # =================================================
+            # HISTORY RESULT
+            # =================================================
+
+            results.append({
+
+                "id":
+                    row["id"],
+
+                "prediction":
+                    row["prediction"],
+
+                "confidence":
+                    row["confidence"],
+
+                "created_at":
+                    row["created_at"],
+
+                "image":
+                    image_base64,
+
+                "heatmap":
+                    heatmap_base64,
+
+                "xai_image":
+                    overlay_base64
+
+            })
+
+
+        return results
+
+
+    except Exception as e:
+
+        print(
+            "History error:",
+            str(e)
+        )
+
+        return {
+
+            "success": False,
+
+            "error":
+                str(e)
+
+        }
+
+
+# ============================================================
+# RUN DIRECTLY
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        "backend.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
