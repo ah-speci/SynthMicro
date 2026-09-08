@@ -1,12 +1,12 @@
-import subprocess
-import sys
-import tempfile
 import os
 import io
 import base64
 import uuid
 import sqlite3
 import json
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -105,6 +105,13 @@ CLASS_NAMES = [
 PURPLE_THRESHOLD = 35.0
 MAX_XAI_CELLS = 6
 SHAP_BACKGROUND_SIZE = 10
+
+# Fast/stable demo mode:
+# Cellpose runs in a separate process to isolate PyTorch from TensorFlow.
+# SHAP and the remote VLM are disabled by default because they can make
+# CPU inference very slow. They can be enabled later with environment vars.
+ENABLE_SHAP = os.getenv("SYNTHMICRO_ENABLE_SHAP", "0") == "1"
+ENABLE_VLM = os.getenv("SYNTHMICRO_ENABLE_VLM", "0") == "1"
 
 # Hugging Face model used by the explanatory report layer.
 HF_VLM_MODEL = os.getenv(
@@ -253,29 +260,21 @@ def json_safe(value: Any) -> Any:
 
 def segment_smear(smear_bgr: np.ndarray):
     """
-    Run Cellpose in a completely separate Python process.
+    Run Cellpose in a separate Python process.
 
-    This is intentional: TensorFlow/ResNet and Cellpose/PyTorch
-    can cause native-library conflicts when loaded in the same process.
+    TensorFlow/ResNet50 stays in the FastAPI process while Cellpose/PyTorch
+    is isolated in a child process. This avoids native-library memory
+    conflicts such as:
+        free(): invalid pointer
+        SIGABRT
     """
-
     with tempfile.TemporaryDirectory(prefix="synthmicro_cellpose_") as tmpdir:
-
         tmpdir = Path(tmpdir)
-
         input_path = tmpdir / "smear.png"
         output_path = tmpdir / "masks.npy"
 
-        # Save image for the Cellpose subprocess.
-        success = cv2.imwrite(
-            str(input_path),
-            smear_bgr
-        )
-
-        if not success:
-            raise RuntimeError(
-                "Failed to create temporary image for Cellpose."
-            )
+        if not cv2.imwrite(str(input_path), smear_bgr):
+            raise RuntimeError("Failed to write temporary image for Cellpose.")
 
         worker_path = Path(__file__).resolve().parent / "cellpose_worker.py"
 
@@ -288,7 +287,6 @@ def segment_smear(smear_bgr: np.ndarray):
 
         print("=" * 60)
         print("Starting isolated Cellpose process...")
-        print("Command:", command)
         print("=" * 60)
 
         process = subprocess.run(
@@ -303,8 +301,7 @@ def segment_smear(smear_bgr: np.ndarray):
 
         if process.returncode != 0:
             raise RuntimeError(
-                "Cellpose subprocess failed.\n\n"
-                + process.stdout
+                "Cellpose subprocess failed.\n\n" + process.stdout
             )
 
         if not output_path.exists():
@@ -315,8 +312,7 @@ def segment_smear(smear_bgr: np.ndarray):
         masks = np.load(output_path)
 
         print(
-            f"Cellpose completed successfully: "
-            f"{int(masks.max())} objects"
+            f"Cellpose completed successfully: {int(np.max(masks))} objects"
         )
 
         return masks
@@ -377,7 +373,11 @@ def make_cell_crops(smear_bgr: np.ndarray, masks: np.ndarray):
 
 def classify_cells(cell_crops):
     if not cell_crops:
-        return np.empty((0, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32), np.empty((0, 5))
+        return (
+            np.empty((0, IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8),
+            np.empty((0, IMG_SIZE, IMG_SIZE, 3), dtype=np.float32),
+            np.empty((0, 5), dtype=np.float32),
+        )
 
     X = np.stack([prepare_cell(c) for c in cell_crops])
     X_preprocessed = preprocess_input(X.astype(np.float32))
@@ -397,15 +397,29 @@ def classify_cells(cell_crops):
 
 base_model = model.get_layer("resnet50")
 target_layer = base_model.get_layer("conv5_block3_out")
-feature_model = tf.keras.Model(
-    inputs=base_model.input,
-    outputs=target_layer.output,
-)
 
 
 def generate_gradcam(image_input: np.ndarray, class_index: int) -> np.ndarray:
+    """
+    Grad-CAM for the saved SynthMicro model.
+
+    The saved model is an outer Sequential model containing a nested
+    ResNet50 Functional model. Therefore the Grad-CAM graph is built from
+    the nested ResNet50 itself, not from model.input/model.inputs.
+    This avoids the Keras 3 "output is not connected to inputs" error.
+    """
+    # Build the Grad-CAM graph lazily, after the model has been loaded.
+    grad_model = tf.keras.Model(
+        inputs=base_model.input,
+        outputs=[
+            target_layer.output,
+            base_model.output,
+        ],
+    )
+
+    # Use the same classifier head as the saved model.
     with tf.GradientTape() as tape:
-        conv_outputs = feature_model(
+        conv_outputs, backbone_output = grad_model(
             image_input,
             training=False,
         )
@@ -418,6 +432,7 @@ def generate_gradcam(image_input: np.ndarray, class_index: int) -> np.ndarray:
         x = model.get_layer("dense_2")(x)
         x = model.get_layer("dropout_3")(x, training=False)
         predictions_out = model.get_layer("dense_3")(x)
+
         class_score = predictions_out[:, class_index]
 
     grads = tape.gradient(class_score, conv_outputs)
@@ -425,12 +440,19 @@ def generate_gradcam(image_input: np.ndarray, class_index: int) -> np.ndarray:
         raise RuntimeError("Grad-CAM gradients could not be calculated.")
 
     pooled_grads = tf.reduce_mean(grads, axis=(1, 2))
+
     conv = conv_outputs[0]
     weights = pooled_grads[0]
 
     heatmap = tf.reduce_sum(conv * weights, axis=-1)
     heatmap = tf.maximum(heatmap, 0)
-    heatmap = heatmap / (tf.reduce_max(heatmap) + 1e-8)
+
+    max_value = tf.reduce_max(heatmap)
+    heatmap = tf.where(
+        max_value > 0,
+        heatmap / max_value,
+        heatmap,
+    )
 
     return heatmap.numpy().astype(np.float32)
 
@@ -525,6 +547,9 @@ def save_shap(cell_bgr: np.ndarray, shap_display: np.ndarray, path: Path, label:
 
 
 def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: Path):
+    if not ENABLE_SHAP:
+        return [], "SHAP disabled for fast/stable runtime mode."
+
     if shap is None:
         return [], f"SHAP is unavailable: {SHAP_IMPORT_ERROR}"
 
@@ -545,14 +570,9 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
 
         values_all = explainer.shap_values(image_input)
 
-        # Current notebook output: ndarray (1, 384, 384, 3, 5).
-        # Older SHAP versions may return a list with one ndarray per class.
         if isinstance(values_all, list):
             class_values = np.asarray(values_all[predicted_index])
-            if class_values.ndim == 4:
-                values = class_values[0]
-            else:
-                values = class_values
+            values = class_values[0] if class_values.ndim == 4 else class_values
         else:
             values_array = np.asarray(values_all)
             if values_array.ndim == 5:
@@ -560,7 +580,9 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
             elif values_array.ndim == 4:
                 values = values_array[0]
             else:
-                raise RuntimeError(f"Unexpected SHAP output shape: {values_array.shape}")
+                raise RuntimeError(
+                    f"Unexpected SHAP output shape: {values_array.shape}"
+                )
 
         if values.ndim == 3:
             shap_magnitude = np.mean(np.abs(values), axis=-1)
@@ -670,9 +692,15 @@ def fallback_cell_explanation(row: dict) -> str:
 
 def build_vlm_explanations(selected_records, cell_df):
     explanations = {}
+
     for rec in selected_records:
         cell_id = rec["cell_id"]
         row = cell_df.loc[cell_df["cell_id"] == cell_id].iloc[0].to_dict()
+
+        if not ENABLE_VLM:
+            explanations[cell_id] = fallback_cell_explanation(row)
+            continue
+
         prompt = (
             f"This segmented microscopy crop was classified by ResNet50 as "
             f"'{row['predicted_class']}' with {row['confidence'] * 100:.1f}% confidence. "
@@ -681,6 +709,7 @@ def build_vlm_explanations(selected_records, cell_df):
             "and domain limitations. Do not diagnose leukemia/cancer and do not "
             "claim a cell type that cannot be supported from the image."
         )
+
         try:
             explanations[cell_id] = hf_explain_image(
                 Path(rec["original_path"]),
@@ -689,6 +718,7 @@ def build_vlm_explanations(selected_records, cell_df):
         except Exception as exc:
             explanations[cell_id] = fallback_cell_explanation(row)
             print(f"HF explanation unavailable for Cell {cell_id}: {exc}")
+
     return explanations
 
 
@@ -748,7 +778,7 @@ def make_pdf_report(
     story.append(Spacer(1, 14))
     story.append(Paragraph(
         "Pipeline: Cellpose segmentation → 384×384 cell extraction → "
-        "ResNet50 classification → Grad-CAM → SHAP → explanatory report.",
+        "Cellpose → ResNet50 → Grad-CAM → optional SHAP → optional VLM → PDF report.",
         styles["BodyText"],
     ))
     story.append(Spacer(1, 14))
@@ -984,9 +1014,8 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
                 "original_path": str(original_path_for_vlm),
             }
         )
-	
+
     # 6. SHAP on the same selected cells.
-    print("========== SHAP START ==========")
     shap_records, shap_error = generate_shap_records(
         X_preprocessed,
         X,
@@ -994,7 +1023,6 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
         xai_cells,
         analysis_dir,
     )
-    print("========== SHAP FINISHED ==========")
 
     # 7. VLM explanations for the selected cell crops.
     explanations = build_vlm_explanations(gradcam_records, cell_df)
@@ -1132,9 +1160,10 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
             for r in shap_records
         ],
         "shap_available": bool(shap_records),
+        "shap_enabled": ENABLE_SHAP,
         "shap_error": shap_error,
         "vlm_model": HF_VLM_MODEL,
-        "vlm_enabled": bool(HF_TOKEN and InferenceClient is not None),
+        "vlm_enabled": bool(ENABLE_VLM and HF_TOKEN and InferenceClient is not None),
         "report_url": f"/reports/{analysis_id}",
         "overlay_url": f"/analysis/{analysis_id}/files/{overlay_path.name}",
         "original_url": f"/analysis/{analysis_id}/files/{original_path.name}",
@@ -1149,12 +1178,14 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
 def root():
     return {
         "status": "running",
-        "pipeline": "Cellpose -> ResNet50 -> Grad-CAM -> SHAP -> Hugging Face VLM -> PDF",
+        "pipeline": "Cellpose -> ResNet50 -> Grad-CAM -> optional SHAP -> optional VLM -> PDF",
         "model": ACTIVE_MODEL_PATH.name,
         "input_size": IMG_SIZE,
         "classes": CLASS_NAMES,
+        "shap_enabled": ENABLE_SHAP,
+        "vlm_enabled": bool(ENABLE_VLM and HF_TOKEN and InferenceClient is not None),
         "hf_vlm_model": HF_VLM_MODEL,
-        "hf_vlm_enabled": bool(HF_TOKEN and InferenceClient is not None),
+        "hf_vlm_enabled": bool(ENABLE_VLM and HF_TOKEN and InferenceClient is not None),
     }
 
 
@@ -1164,7 +1195,7 @@ def health():
         "status": "healthy",
         "model": ACTIVE_MODEL_PATH.name,
         "cellpose_available": True,
-        "shap_available": shap is not None,
+        "shap_available": bool(ENABLE_SHAP and shap is not None),
         "huggingface_available": InferenceClient is not None,
         "hf_token_configured": bool(HF_TOKEN),
     }
