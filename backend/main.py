@@ -7,8 +7,8 @@ import base64
 import uuid
 import sqlite3
 import json
-import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -18,7 +18,7 @@ import pandas as pd
 import tensorflow as tf
 from PIL import Image
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
@@ -35,8 +35,10 @@ except Exception as exc:
 
 try:
     from google import genai
+    from google.genai import types as genai_types
 except Exception as exc:
     genai = None
+    genai_types = None
     GEMINI_IMPORT_ERROR = str(exc)
 
 from tensorflow.keras.applications.resnet50 import preprocess_input
@@ -64,7 +66,7 @@ app = FastAPI(
     title="SynthMicro API",
     description=(
         "Whole blood-smear analysis using Cellpose, ResNet50, "
-        "Grad-CAM, SHAP and an optional Gemini VLM report."
+        "Grad-CAM, SHAP and an optional Hugging Face VLM report."
     ),
     version="2.0.0",
 )
@@ -107,10 +109,14 @@ PURPLE_THRESHOLD = 35.0
 MAX_XAI_CELLS = 3
 SHAP_BACKGROUND_SIZE = 2
 
-# Google Gemini model used by the explanatory report layer.
-# Gemini is cloud-hosted and is not loaded onto the RTX 4050.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Fast multimodal explanation layer.
+# Flash-Lite was verified with the project's test image at ~2 seconds.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MAX_OUTPUT_TOKENS = 180
+GEMINI_THINKING_LEVEL = "minimal"
+GEMINI_STATUS_DIR = XAI_DIR / "gemini_status"
+GEMINI_STATUS_DIR.mkdir(parents=True, exist_ok=True)
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 XAI_DIR.mkdir(parents=True, exist_ok=True)
@@ -702,109 +708,44 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
 
 
 # ============================================================
-# GEMINI VLM REPORT EXPLANATIONS
+# VLM REPORT EXPLANATIONS
 # ============================================================
 
-def make_vlm_evidence_image(
-    original_path: Path,
-    gradcam_path: Path | None,
-    shap_path: Path | None,
-    output_path: Path,
-):
-    """Create an Original + Grad-CAM + SHAP evidence image for Gemini."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    images = [Image.open(original_path).convert("RGB")]
-    titles = ["Original Cell"]
-
-    if gradcam_path and Path(gradcam_path).exists():
-        images.append(Image.open(gradcam_path).convert("RGB"))
-        titles.append("Grad-CAM")
-
-    if shap_path and Path(shap_path).exists():
-        images.append(Image.open(shap_path).convert("RGB"))
-        titles.append("SHAP")
-
-    fig, axes = plt.subplots(1, len(images), figsize=(5 * len(images), 4))
-    if len(images) == 1:
-        axes = [axes]
-
-    for ax, image, title in zip(axes, images, titles):
-        ax.imshow(image)
-        ax.set_title(title)
-        ax.axis("off")
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-
-
 def gemini_explain_image(image_path: Path, prompt: str) -> str:
-    """Generate a detailed cloud explanation using Gemini 2.5 Flash."""
-    if genai is None:
-        raise RuntimeError(
-            f"google-genai is unavailable: {GEMINI_IMPORT_ERROR}"
-        )
-
+    """Fast Gemini multimodal explanation using the standard image API."""
+    if genai is None or genai_types is None:
+        raise RuntimeError(f"google-genai is unavailable: {GEMINI_IMPORT_ERROR}")
     if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not configured. "
-            "Set GEMINI_API_KEY in the backend environment."
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=30000),
+    )
+    try:
+        image_bytes = image_path.read_bytes()
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                genai_types.Part.from_text(text=prompt),
+                genai_types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type=("image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"),
+                ),
+            ],
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
+                thinking_config=genai_types.ThinkingConfig(
+                    thinking_level=GEMINI_THINKING_LEVEL,
+                ),
+            ),
         )
-
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    image = Image.open(image_path).convert("RGB")
-
-    # Retry transient API/rate-limit/server errors.
-    delays = [5, 15, 30, 60]
-
-    for attempt, delay in enumerate(delays + [0]):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[prompt, image],
-                config={
-                    "system_instruction": (
-                        "You are an explanatory assistant for a research-oriented "
-                        "blood-smear image-analysis system. Do not diagnose "
-                        "leukemia, AML, cancer, or any disease. Distinguish "
-                        "visible observations from machine-learning predictions. "
-                        "Never invent morphology. Treat Grad-CAM and SHAP as "
-                        "model-attribution evidence, not direct biological "
-                        "measurements."
-                    ),
-                    "temperature": 0.2,
-                    "max_output_tokens": 900,
-                },
-            )
-
-            if not response.text:
-                raise RuntimeError("Gemini returned an empty response.")
-
-            return response.text.strip()
-
-        except Exception as exc:
-            error_text = str(exc).lower()
-            retryable = any(
-                marker in error_text
-                for marker in (
-                    "429", "500", "502", "503", "504",
-                    "resource exhausted", "unavailable",
-                    "temporarily", "rate limit", "deadline",
-                )
-            )
-
-            if retryable and attempt < len(delays):
-                print(
-                    f"Gemini temporarily unavailable "
-                    f"(attempt {attempt + 1}/5). Retrying in {delay}s..."
-                )
-                time.sleep(delay)
-                continue
-
-            raise
+        text = (response.text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
+    finally:
+        client.close()
 
 
 def fallback_cell_explanation(row: dict) -> str:
@@ -824,135 +765,100 @@ def fallback_cell_explanation(row: dict) -> str:
     )
 
 
-def build_vlm_explanations(
-    selected_records,
-    shap_records,
-    cell_df,
-    analysis_dir: Path,
-):
-    """Generate detailed Gemini explanations using the original and XAI panels."""
+def _gemini_status_path(analysis_id: str) -> Path:
+    return GEMINI_STATUS_DIR / f"{analysis_id}.json"
+
+
+def write_gemini_status(analysis_id: str, payload: dict) -> None:
+    path = _gemini_status_path(analysis_id)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def build_vlm_explanations(selected_records, cell_df):
+    """Return instant fallback text; real Gemini work runs in background."""
     explanations = {}
-
-    shap_by_cell = {int(rec["cell_id"]): rec for rec in shap_records}
-
     for rec in selected_records:
-        cell_id = int(rec["cell_id"])
-        matches = cell_df.loc[cell_df["cell_id"] == cell_id]
-
-        if matches.empty:
-            continue
-
-        row = matches.iloc[0].to_dict()
-        shap_rec = shap_by_cell.get(cell_id)
-        evidence_path = analysis_dir / f"cell_{cell_id}_gemini_evidence.png"
-
-        try:
-            make_vlm_evidence_image(
-                original_path=Path(rec["original_path"]),
-                gradcam_path=Path(rec["path"]),
-                shap_path=Path(shap_rec["path"]) if shap_rec else None,
-                output_path=evidence_path,
-            )
-
-            area = row.get("area", "not available")
-            purple = row.get("purple_score", "not available")
-            purple_text = (
-                f"{float(purple):.2f}"
-                if isinstance(purple, (float, int, np.floating, np.integer))
-                else str(purple)
-            )
-
-            probability_text = "not available"
-            prediction_vector = row.get("prediction_vector")
-            if prediction_vector is not None:
-                try:
-                    vector = np.asarray(prediction_vector, dtype=float)
-                    probability_text = ", ".join(
-                        f"{CLASS_NAMES[i]}={vector[i] * 100:.2f}%"
-                        for i in range(min(len(CLASS_NAMES), len(vector)))
-                    )
-                except Exception:
-                    pass
-
-            prompt = f"""
-Analyze the supplied evidence image for Cell {cell_id} from a
-research-oriented blood-smear computer-vision system.
-
-The image contains:
-1. Original segmented cell
-2. Grad-CAM visualization
-3. SHAP attribution visualization
-
-MODEL INFORMATION
-- ResNet50 predicted class: {row["predicted_class"]}
-- Model confidence: {row["confidence"] * 100:.2f}%
-- Cell area: {area} pixels
-- Purple score: {purple_text}
-- Class probabilities: {probability_text}
-
-Write a detailed scientific-style explanation using EXACTLY these sections:
-
-1. Visible morphology
-Describe only features actually visible in the original cell. Discuss apparent
-cell shape, nucleus, nuclear-to-cytoplasmic relationship, chromatin appearance,
-nucleoli if clearly visible, cytoplasm, granularity, staining and boundaries.
-If a feature cannot be reliably determined, say so.
-
-2. Relationship to the ResNet50 prediction
-Explain which visible characteristics may be compatible with the predicted
-class. Clearly separate direct visual observations from the neural-network
-classification.
-
-3. Alternative class considerations
-Discuss which other closed-set classes could potentially overlap with the
-appearance. Available classes: basophil, erythroblast, monocyte, myeloblast,
-seg_neutrophil.
-
-4. Confidence and uncertainty
-Explain the meaning and limitations of the model confidence. Do not interpret
-confidence as a probability of leukemia, AML or cancer.
-
-5. Grad-CAM interpretation
-Describe where Grad-CAM activation appears concentrated: inside the cell,
-near its boundary, or in surrounding/background areas. Do not claim that an
-activation region definitively represents a biological structure.
-
-6. SHAP interpretation
-Describe where SHAP attribution appears concentrated. Explain that SHAP
-represents pixel-level contribution toward the selected model output and is
-not a direct biological measurement.
-
-7. Agreement between XAI methods
-State whether Grad-CAM and SHAP appear broadly consistent or different.
-Do not overstate agreement.
-
-8. Limitations
-Discuss segmentation quality, staining/illumination variation, image quality,
-dataset limitations, closed-set classification, domain shift and possible
-model misclassification.
-
-9. Conclusion
-Give a concise conclusion about this cell's model-level result.
-
-IMPORTANT:
-- Do not diagnose AML, leukemia, cancer or any disease.
-- A myeloblast prediction does not establish malignancy.
-- Do not invent biological structures.
-- Do not call model confidence a disease probability.
-- If image quality prevents a reliable observation, say so.
-- XAI panels describe model behavior, not biological causality.
-"""
-
-            explanations[cell_id] = gemini_explain_image(
-                evidence_path,
-                prompt,
-            )
-
-        except Exception as exc:
-            explanations[cell_id] = fallback_cell_explanation(row)
-            print(f"Gemini explanation unavailable for Cell {cell_id}: {exc}")
-
+        cell_id = rec["cell_id"]
+        row = cell_df.loc[cell_df["cell_id"] == cell_id].iloc[0].to_dict()
+        explanations[cell_id] = fallback_cell_explanation(row)
     return explanations
+
+
+def run_gemini_background(analysis_id: str, gradcam_records: list, cell_df: pd.DataFrame) -> None:
+    """Generate Gemini explanations concurrently without blocking /predict."""
+    try:
+        cells = []
+        for rec in gradcam_records:
+            cell_id = int(rec["cell_id"])
+            row = cell_df.loc[cell_df["cell_id"] == cell_id].iloc[0].to_dict()
+            cells.append({
+                "cell_id": cell_id,
+                "class": str(row["predicted_class"]),
+                "confidence": float(row["confidence"]),
+                "image_path": str(rec["original_path"]),
+            })
+
+        status = {
+            "analysis_id": analysis_id,
+            "status": "processing" if cells else "completed",
+            "model": GEMINI_MODEL,
+            "results": {
+                str(c["cell_id"]): {
+                    "cell_id": c["cell_id"],
+                    "status": "queued",
+                    "text": None,
+                    "class": c["class"],
+                    "confidence": c["confidence"],
+                }
+                for c in cells
+            },
+        }
+        write_gemini_status(analysis_id, status)
+
+        def worker(cell):
+            prompt = (
+                f"Describe this segmented blood-smear cell for a research-oriented "
+                f"computer-vision system. The ResNet50 model predicts '{cell['class']}' "
+                f"with {cell['confidence'] * 100:.1f}% confidence. "
+                "In 3-4 concise sentences, describe only visible morphology, "
+                "staining/color, nucleus/cytoplasm appearance, and image-quality "
+                "limitations. Explain how visible features could relate to the "
+                "model prediction, but do not diagnose leukemia, AML, cancer, or "
+                "any disease. Do not invent morphology."
+            )
+            try:
+                text = gemini_explain_image(Path(cell["image_path"]), prompt)
+                return cell["cell_id"], text, None
+            except Exception as exc:
+                return cell["cell_id"], None, str(exc)
+
+        with ThreadPoolExecutor(max_workers=min(3, max(1, len(cells)))) as executor:
+            futures = [executor.submit(worker, cell) for cell in cells]
+            for future in as_completed(futures):
+                cell_id, text, error = future.result()
+                key = str(cell_id)
+                status = json.loads(_gemini_status_path(analysis_id).read_text(encoding="utf-8"))
+                status["results"][key]["status"] = "completed" if text else "error"
+                status["results"][key]["text"] = text
+                if error:
+                    status["results"][key]["error"] = error
+                write_gemini_status(analysis_id, status)
+
+        final = json.loads(_gemini_status_path(analysis_id).read_text(encoding="utf-8"))
+        final["status"] = "completed"
+        write_gemini_status(analysis_id, final)
+        print(f"Gemini background analysis complete: {analysis_id}")
+    except Exception as exc:
+        print(f"Gemini background analysis failed: {analysis_id}: {exc}")
+        write_gemini_status(analysis_id, {
+            "analysis_id": analysis_id,
+            "status": "error",
+            "model": GEMINI_MODEL,
+            "error": str(exc),
+            "results": {},
+        })
 
 
 # ============================================================
@@ -971,6 +877,14 @@ def make_pdf_report(
     explanations: dict,
     output_path: Path,
 ):
+    """Create a detailed, research-oriented XAI report.
+
+    The report is intentionally explanatory rather than diagnostic.  It documents
+    what the pipeline measured, how candidate cells were selected, what the
+    classifier predicted, and how Grad-CAM/SHAP should be interpreted.
+    """
+    from xml.sax.saxutils import escape as xml_escape
+
     total_segmented = len(cell_df)
     candidate_count = len(candidate_df)
     myeloblast_count = len(myeloblast_df)
@@ -980,168 +894,713 @@ def make_pdf_report(
         else 0.0
     )
 
+    # ---------- Styles ----------
     styles = getSampleStyleSheet()
-    styles.add(
-        ParagraphStyle(
-            name="SmallNote",
-            parent=styles["BodyText"],
-            fontSize=8.5,
-            leading=11,
-            textColor=colors.HexColor("#555555"),
-        )
-    )
+    styles.add(ParagraphStyle(
+        name="ReportSubtitle", parent=styles["BodyText"], fontSize=10,
+        leading=14, textColor=colors.HexColor("#4b5563"), spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="SmallNote", parent=styles["BodyText"], fontSize=8.2,
+        leading=10.5, textColor=colors.HexColor("#5b6470"),
+    ))
+    styles.add(ParagraphStyle(
+        name="SectionIntro", parent=styles["BodyText"], fontSize=9.5,
+        leading=14, textColor=colors.HexColor("#374151"), spaceAfter=8,
+    ))
+    styles.add(ParagraphStyle(
+        name="CellHeading", parent=styles["Heading2"], fontSize=13,
+        leading=16, spaceBefore=6, spaceAfter=7,
+    ))
+    styles.add(ParagraphStyle(
+        name="BoxText", parent=styles["BodyText"], fontSize=9,
+        leading=13, leftIndent=8, rightIndent=8, spaceBefore=5, spaceAfter=5,
+    ))
+    styles.add(ParagraphStyle(
+        name="Metric", parent=styles["BodyText"], fontSize=15,
+        leading=18, alignment=1, spaceAfter=2,
+    ))
 
     doc = SimpleDocTemplate(
-        str(output_path),
-        pagesize=A4,
-        rightMargin=36,
-        leftMargin=36,
-        topMargin=36,
-        bottomMargin=36,
+        str(output_path), pagesize=A4,
+        rightMargin=36, leftMargin=36, topMargin=48, bottomMargin=42,
+        title=f"SynthMicro XAI Report - {analysis_id}",
+        author="SynthMicro",
     )
 
+    def footer(canvas, doc_obj):
+        canvas.saveState()
+        canvas.setStrokeColor(colors.HexColor("#d1d5db"))
+        canvas.line(36, 30, A4[0] - 36, 30)
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(colors.HexColor("#6b7280"))
+        canvas.drawString(36, 19, "SynthMicro | Research-oriented computer-vision report | Not a clinical diagnosis")
+        canvas.drawRightString(A4[0] - 36, 19, f"Page {doc_obj.page}")
+        canvas.restoreState()
+
     story = []
+
+    def section(title, intro=None):
+        story.append(Paragraph(title, styles["Heading1"]))
+        if intro:
+            story.append(Paragraph(intro, styles["SectionIntro"]))
+
+    def info_box(title, body, background="#f3f6fa"):
+        data = [[
+            Paragraph(f"<b>{xml_escape(title)}</b>", styles["BodyText"]),
+            Paragraph(body, styles["BoxText"]),
+        ]]
+        t = Table(data, colWidths=[1.45 * inch, 4.95 * inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 9))
+
+    def pct(v):
+        return f"{float(v) * 100:.1f}%"
+
+    # ---------- 1. Executive summary ----------
     story.append(Paragraph("SynthMicro — Whole Blood Smear XAI Report", styles["Title"]))
-    story.append(Spacer(1, 8))
     story.append(Paragraph(
-        f"Analysis ID: {analysis_id}<br/>"
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "Detailed analysis of segmentation, cell classification and explainable-AI evidence",
+        styles["ReportSubtitle"],
+    ))
+    story.append(Paragraph(
+        f"<b>Analysis ID:</b> {xml_escape(analysis_id)}<br/>"
+        f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br/>"
+        "<b>Input:</b> uploaded blood-smear microscopy image",
         styles["SmallNote"],
     ))
-    story.append(Spacer(1, 14))
-    story.append(Paragraph(
-        "Pipeline: Cellpose segmentation → 384×384 cell extraction → "
-        "ResNet50 classification → Grad-CAM → SHAP → Gemini 2.5 Flash explanatory report.",
-        styles["BodyText"],
-    ))
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, 12))
+
+    pipeline_text = (
+        "<b>Pipeline:</b> Cellpose segmentation &rarr; candidate-cell extraction at 384&times;384 &rarr; "
+        "ResNet50 five-class classification &rarr; Grad-CAM &rarr; SHAP &rarr; explanatory report."
+    )
+    story.append(Paragraph(pipeline_text, styles["BodyText"]))
+    story.append(Spacer(1, 12))
 
     summary = [
-        ["Measurement", "Result"],
-        ["Cellpose objects", str(total_segmented)],
-        ["Nucleated-cell candidates", str(candidate_count)],
-        ["Myeloblast-like candidates", str(myeloblast_count)],
-        ["Myeloblast-like proportion", f"{proportion:.2f}%"],
+        ["Measurement", "Result", "What it means"],
+        ["Cellpose objects", str(total_segmented), "Objects segmented from the uploaded smear."],
+        ["Candidate cells", str(candidate_count), "Objects passing the purple-score candidate-selection rule."],
+        ["Myeloblast-like candidates", str(myeloblast_count), "Candidates whose ResNet50 top class was myeloblast."],
+        ["Myeloblast-like proportion", f"{proportion:.2f}%", "Myeloblast-like candidates divided by candidate cells."],
     ]
-    table = Table(summary, colWidths=[3.3 * inch, 2.2 * inch])
+    table = Table(summary, colWidths=[1.75 * inch, 1.1 * inch, 3.75 * inch], repeatRows=1)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eef5")),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#9ca3af")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("LEADING", (0, 0), (-1, -1), 10),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("ALIGN", (1, 1), (1, -1), "CENTER"),
         ("PADDING", (0, 0), (-1, -1), 6),
     ]))
     story.append(table)
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, 13))
 
-    story.append(Paragraph(
-        "<b>Screening interpretation:</b> the proportion above is a "
-        "research-oriented model indicator based on candidate cells selected "
-        "by the notebook's purple-score rule. It is not a cancer probability "
-        "and does not establish AML or another diagnosis.",
-        styles["BodyText"],
-    ))
+    info_box(
+        "How to read this result",
+        "The numbers above describe the behavior of a computer-vision pipeline on this image. "
+        "A high classifier confidence means the ResNet50 model strongly preferred one of its "
+        "available image classes; it does <b>not</b> mean a high probability of leukemia, AML, "
+        "or any other disease. The candidate percentage is also not a cancer prevalence estimate.",
+        "#fff8e7",
+    )
+    info_box(
+        "Important safety interpretation",
+        "This report is intended for research, model evaluation and screening-oriented exploration. "
+        "It does not establish a diagnosis. Clinical interpretation requires expert hematopathology, "
+        "appropriate laboratory testing and the complete clinical context.",
+        "#fef2f2",
+    )
     story.append(PageBreak())
 
-    story.append(Paragraph("Whole Smear", styles["Heading1"]))
+    # ---------- 2. Methodology ----------
+    section(
+        "Analysis Methodology",
+        "The following sections explain what each stage contributes and where uncertainty can enter the pipeline.",
+    )
+    method_rows = [
+        ["Stage", "Operation", "Output used downstream"],
+        ["1. Cellpose", "Segments visible cell/object regions in the whole smear.", "Object masks and cell geometry."],
+        ["2. Candidate selection", "Computes a purple-score and retains objects at or above the configured threshold.", "Candidate-cell subset for reporting."],
+        ["3. ResNet50", "Resizes each selected crop to 384×384 and predicts one of five closed-set classes.", "Class label and softmax confidence."],
+        ["4. Grad-CAM", "Highlights image regions that contribute to the selected class activation.", "Spatial explanation of model behavior."],
+        ["5. SHAP", "Estimates pixel-level attribution magnitude for the selected prediction.", "Pixel attribution explanation."],
+        ["6. Gemini", "Optional multimodal commentary describes visible morphology for selected cells.", "Separate descriptive commentary; not a diagnosis."],
+    ]
+    mt = Table(method_rows, colWidths=[1.1 * inch, 3.0 * inch, 2.5 * inch], repeatRows=1)
+    mt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eef5")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9ca3af")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("LEADING", (0, 0), (-1, -1), 10),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(mt)
+    story.append(Spacer(1, 12))
+
+    info_box(
+        "Candidate-selection rule",
+        "Only segmented objects with the configured purple-score threshold are treated as candidate "
+        "cells for the screening indicator. This is an image-processing rule, not a laboratory definition "
+        "of a nucleated cell. Objects outside the threshold can therefore be missed, while visually similar "
+        "objects can be retained.",
+    )
+    info_box(
+        "Closed-set classifier limitation",
+        "The ResNet50 model has five outputs: <b>basophil, erythroblast, monocyte, myeloblast, and "
+        "segmented neutrophil</b>. RBCs and unknown cell types are not explicit outputs, so an unsuitable "
+        "input can still be assigned one of these five labels.",
+    )
+    story.append(PageBreak())
+
+    # ---------- 3. Whole smear ----------
+    section("Whole Smear", "Original uploaded image used as the input to the segmentation stage.")
     story.append(RLImage(str(smear_path), width=6.7 * inch, height=5.1 * inch))
     story.append(Spacer(1, 8))
     story.append(Paragraph(
-        "Original uploaded blood-smear image analyzed by Cellpose.",
-        styles["SmallNote"],
+        "Visual context: the complete field contains numerous erythrocytes and several strongly stained "
+        "nucleated-looking objects. Downstream results depend on what Cellpose can segment reliably in this field.",
+        styles["SectionIntro"],
     ))
     story.append(PageBreak())
 
-    story.append(Paragraph("Segmentation and Candidate Overlay", styles["Heading1"]))
+    # ---------- 4. Segmentation ----------
+    section(
+        "Segmentation and Candidate Overlay",
+        "Labels show the candidate-cell ID, predicted class and classifier confidence used by the report.",
+    )
     story.append(RLImage(str(overlay_path), width=6.7 * inch, height=5.1 * inch))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        f"Cellpose produced <b>{total_segmented}</b> objects. <b>{candidate_count}</b> met the candidate "
+        f"selection rule, and <b>{myeloblast_count}</b> of those were classified as myeloblast by the model. "
+        "The overlay is a bookkeeping and visualization aid; it does not certify that every label corresponds "
+        "to a biologically correct cell type.",
+        styles["SectionIntro"],
+    ))
     story.append(PageBreak())
 
-    story.append(Paragraph("Cell-Level Results", styles["Heading1"]))
-    rows = [["ID", "Area", "Purple", "Class", "Confidence"]]
+    # ---------- 5. Candidate results ----------
+    section(
+        "Cell-Level Results",
+        "Candidate measurements and model predictions. Area is the segmented-pixel count; purple score is the "
+        "candidate-selection feature; confidence is the model's top softmax output.",
+    )
+    rows = [["ID", "Area", "X", "Y", "Purple", "Class", "Confidence"]]
     for _, row in candidate_df.sort_values("cell_id").iterrows():
         rows.append([
-            str(int(row["cell_id"])),
-            str(int(row["area"])),
-            f"{row['purple_score']:.1f}",
-            str(row["predicted_class"]),
-            f"{row['confidence'] * 100:.1f}%",
+            str(int(row["cell_id"])), str(int(row["area"])), str(int(row["x"])), str(int(row["y"])),
+            f"{row['purple_score']:.1f}", str(row["predicted_class"]), pct(row["confidence"]),
         ])
-    results_table = Table(
-        rows,
-        repeatRows=1,
-        colWidths=[0.55 * inch, 0.7 * inch, 0.8 * inch, 1.8 * inch, 1.0 * inch],
-    )
+    results_table = Table(rows, colWidths=[0.45*inch, 0.62*inch, 0.48*inch, 0.48*inch, 0.62*inch, 1.65*inch, 0.82*inch], repeatRows=1)
     results_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eef5")),
-        ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9ca3af")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("PADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(results_table)
+    story.append(Spacer(1, 12))
+
+    distribution = candidate_df["predicted_class"].value_counts().to_dict() if candidate_count else {}
+    dist_rows = [["Predicted class", "Candidate count", "Share of candidates"]]
+    for cls in CLASS_NAMES:
+        count = int(distribution.get(cls, 0))
+        share = count / candidate_count * 100 if candidate_count else 0.0
+        dist_rows.append([cls, str(count), f"{share:.1f}%"])
+    dt = Table(dist_rows, colWidths=[2.2*inch, 1.6*inch, 2.0*inch], repeatRows=1)
+    dt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eef5")),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9ca3af")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(Paragraph("Candidate class distribution", styles["Heading3"]))
+    story.append(dt)
+    story.append(Spacer(1, 10))
+
+    info_box(
+        "Confidence versus probability of disease",
+        "For each crop, the reported confidence is the largest value among the five ResNet50 output "
+        "classes. It is a measure of model preference within this closed label set. It has not been presented "
+        "as a calibrated probability of AML, leukemia or any other clinical outcome.",
+    )
+    story.append(PageBreak())
+
+    # ---------- 6. Per-cell probability detail ----------
+    section(
+        "Per-Cell Model Probability Detail",
+        "The table below exposes the complete five-class output for each candidate when that vector is available.",
+    )
+    prob_rows = [["Cell", "Basophil", "Erythroblast", "Monocyte", "Myeloblast", "Seg. neutrophil"]]
+    for _, row in candidate_df.sort_values("cell_id").iterrows():
+        vec = row.get("prediction_vector")
+        if vec is None:
+            values = ["—"] * 5
+        else:
+            try:
+                values = [f"{float(v)*100:.1f}%" for v in list(vec)[:5]]
+                if len(values) < 5:
+                    values += ["—"] * (5-len(values))
+            except Exception:
+                values = ["—"] * 5
+        prob_rows.append([str(int(row["cell_id"]))] + values)
+    pt = Table(prob_rows, colWidths=[0.55*inch, 1.1*inch, 1.15*inch, 1.0*inch, 1.1*inch, 1.25*inch], repeatRows=1)
+    pt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eef5")),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#9ca3af")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("FONTSIZE", (0, 0), (-1, -1), 7),
         ("ALIGN", (0, 0), (-1, -1), "CENTER"),
         ("PADDING", (0, 0), (-1, -1), 4),
     ]))
-    story.append(results_table)
+    story.append(pt)
+    story.append(Spacer(1, 12))
+    info_box(
+        "Why show all five outputs?",
+        "A single top-class label can hide how close the model was to another class. The full vector gives "
+        "a better picture of the model's internal competition between the five available labels. Even so, these "
+        "values remain model outputs and should not be interpreted as biological probabilities.",
+    )
     story.append(PageBreak())
 
-    story.append(Paragraph("Grad-CAM Explanations", styles["Heading1"]))
-    story.append(Paragraph(
-        "Grad-CAM shows regions contributing to the selected model class. "
-        "It is an explanation of model behavior, not a direct measurement "
-        "of a biological structure.",
-        styles["BodyText"],
-    ))
-    story.append(Spacer(1, 10))
+    # ---------- 7. Grad-CAM ----------
+    section(
+        "Grad-CAM Explanations",
+        "Grad-CAM is presented here as a visual audit of the ResNet50 decision. Each cell receives a dedicated "
+        "report page so the reader can examine the original crop, the heatmap and the overlay together with a "
+        "detailed explanation of what the visualization can and cannot establish.",
+    )
 
-    for rec in gradcam_records:
-        story.append(Paragraph(
-            f"Cell {rec['cell_id']} — {rec['class']} ({rec['confidence'] * 100:.1f}%)",
-            styles["Heading3"],
-        ))
-        story.append(RLImage(rec["path"], width=6.7 * inch, height=2.2 * inch))
-        story.append(Spacer(1, 7))
-        if rec["cell_id"] in explanations:
-            story.append(Paragraph(explanations[rec["cell_id"]], styles["BodyText"]))
-        story.append(Spacer(1, 10))
+    if gradcam_records:
+        for idx, rec in enumerate(gradcam_records):
+            cell_id = int(rec["cell_id"])
+            cls = str(rec["class"])
+            conf = float(rec["confidence"])
+            row = cell_df.loc[cell_df["cell_id"] == cell_id].iloc[0]
+            area = int(row["area"])
+            purple = float(row["purple_score"])
+            shap_present = any(int(s["cell_id"]) == cell_id for s in shap_records)
 
-    story.append(PageBreak())
-    story.append(Paragraph("SHAP Explanations", styles["Heading1"]))
-    story.append(Paragraph(
-        "SHAP attribution magnitude summarizes the magnitude of pixel-level "
-        "contribution toward the selected class. It is a model explanation, "
-        "not a clinical measurement.",
-        styles["BodyText"],
-    ))
-    story.append(Spacer(1, 10))
+            if idx > 0:
+                story.append(PageBreak())
 
-    if shap_records:
-        for rec in shap_records:
             story.append(Paragraph(
-                f"Cell {rec['cell_id']} — {rec['class']} ({rec['confidence'] * 100:.1f}%)",
-                styles["Heading3"],
+                f"Cell {cell_id} — {xml_escape(cls)} prediction ({pct(conf)})",
+                styles["CellHeading"],
             ))
-            story.append(RLImage(rec["path"], width=6.7 * inch, height=2.2 * inch))
+
+            metrics = [
+                ["Cell ID", str(cell_id), "Predicted class", xml_escape(cls)],
+                ["Segmented area", f"{area:,} pixels", "Purple score", f"{purple:.1f}"],
+                ["Top-class confidence", pct(conf), "SHAP available", "Yes" if shap_present else "No"],
+            ]
+            metric_table = Table(metrics, colWidths=[1.25*inch, 1.55*inch, 1.45*inch, 2.25*inch])
+            metric_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eef2f7")),
+                ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#eef2f7")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#c4cbd4")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7.8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("PADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(metric_table)
+            story.append(Spacer(1, 9))
+
+            story.append(RLImage(rec["path"], width=6.7 * inch, height=2.35 * inch))
             story.append(Spacer(1, 8))
+
+            story.append(Paragraph(
+                "<b>What the three panels represent.</b> The <b>Original</b> panel is the 384×384 image crop "
+                "presented to the classifier after candidate-cell extraction. The <b>Grad-CAM Heatmap</b> converts "
+                "the class-specific activation information into a spatial visualization. Brighter or warmer regions "
+                "represent areas with stronger contribution in the Grad-CAM representation. The <b>Grad-CAM Overlay</b> "
+                "places that information back over the cell image so the reader can judge whether the highlighted "
+                "areas appear to lie inside the segmented object or near its boundary/background. These panels should "
+                "always be interpreted together rather than treating the heatmap alone as a biological map.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                f"<b>What the model decided.</b> For Cell {cell_id}, ResNet50 selected <b>{xml_escape(cls)}</b> "
+                f"as its highest-scoring class with a reported confidence of <b>{pct(conf)}</b>. The segmented "
+                f"object contains <b>{area:,} pixels</b>, and its purple score is <b>{purple:.1f}</b>, which is "
+                "the image-processing feature used by this pipeline when selecting candidate cells. These values "
+                "describe the computational pathway leading to the prediction. They are not measurements of disease "
+                "severity, blast percentage in blood or bone marrow, or a probability of AML.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>How to read the highlighted regions.</b> The most useful question is whether the strongest "
+                "activation is concentrated on the segmented cell rather than on empty background, neighboring "
+                "erythrocytes, image borders, debris or other unrelated structures. A heatmap that broadly follows "
+                "the cell can provide more intuitive evidence that the model used information contained within the "
+                "candidate crop. Conversely, strong activation outside the cell or at a visually unusual artifact "
+                "can indicate that the prediction may be sensitive to contextual or acquisition-related features. "
+                "Grad-CAM cannot by itself determine whether a highlighted area is a nucleus, nucleolus, chromatin "
+                "pattern, cytoplasmic feature or another specific hematological structure.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>Relationship to the cell-level measurement.</b> The segmented area and purple score explain why "
+                "the object entered the downstream analysis, while the ResNet50 prediction describes the model's "
+                "preferred class after the crop was created. Grad-CAM adds a spatial explanation of that decision. "
+                "Keeping these stages separate is important: a correctly drawn mask does not guarantee a correct "
+                "classification, and a visually plausible heatmap does not validate the segmentation or the class "
+                "label. The evidence is therefore best understood as a chain of computational observations.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>Cross-check recommended.</b> Compare this Grad-CAM result with the original smear and, where "
+                "available, the SHAP attribution for the same cell. Look for consistency in the general location of "
+                "model-relevant pixels, while remembering that Grad-CAM and SHAP use different explanation mechanisms. "
+                "Agreement can make the model decision easier to audit, but disagreement is not automatically evidence "
+                "that the model is wrong; it is a reason to inspect the crop, segmentation and prediction more closely.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            if explanations.get(cell_id):
+                story.append(Paragraph(
+                    f"<b>Automated descriptive commentary.</b> {xml_escape(str(explanations[cell_id]))}",
+                    styles["BodyText"],
+                ))
+                story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>Interpretive boundary.</b> A myeloblast prediction, even when the classifier confidence is very "
+                "high, remains a learned image-classification output within a five-class closed set. It is not a "
+                "confirmed morphological diagnosis and should not be converted into a leukemia or AML probability. "
+                "Clinical interpretation requires appropriate hematopathology review, laboratory testing and the "
+                "broader clinical context.",
+                styles["BodyText"],
+            ))
+
     else:
         story.append(Paragraph(
-            "SHAP output was unavailable for this analysis.",
+            "No Grad-CAM records were available for this analysis. This means the local visual explanation stage "
+            "did not produce a usable record for the selected candidates; it should not be interpreted as evidence "
+            "that the classifier had no basis for its prediction.",
             styles["BodyText"],
+        ))
+    story.append(PageBreak())
+
+    # ---------- 8. SHAP ----------
+    section(
+        "SHAP Explanations",
+        "SHAP provides a second, pixel-level view of model attribution. Each available cell receives a dedicated "
+        "page with an explanation of attribution magnitude, how to inspect the overlay and how SHAP should be "
+        "distinguished from a biological or clinical measurement.",
+    )
+
+    if shap_records:
+        for idx, rec in enumerate(shap_records):
+            cell_id = int(rec["cell_id"])
+            cls = str(rec["class"])
+            conf = float(rec["confidence"])
+            row = cell_df.loc[cell_df["cell_id"] == cell_id].iloc[0]
+            area = int(row["area"])
+            purple = float(row["purple_score"])
+
+            if idx > 0:
+                story.append(PageBreak())
+
+            story.append(Paragraph(
+                f"Cell {cell_id} — SHAP attribution for {xml_escape(cls)} ({pct(conf)})",
+                styles["CellHeading"],
+            ))
+
+            metrics = [
+                ["Cell ID", str(cell_id), "Predicted class", xml_escape(cls)],
+                ["Segmented area", f"{area:,} pixels", "Purple score", f"{purple:.1f}"],
+                ["Model confidence", pct(conf), "Explanation type", "SHAP pixel attribution"],
+            ]
+            metric_table = Table(metrics, colWidths=[1.25*inch, 1.55*inch, 1.45*inch, 2.25*inch])
+            metric_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eef2f7")),
+                ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#eef2f7")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#c4cbd4")),
+                ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7.8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("PADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(metric_table)
+            story.append(Spacer(1, 9))
+
+            story.append(RLImage(rec["path"], width=6.7 * inch, height=2.35 * inch))
+            story.append(Spacer(1, 8))
+
+            story.append(Paragraph(
+                "<b>What SHAP is showing.</b> The Original panel is the exact candidate crop used for the "
+                "classification/explanation process. The SHAP Attribution Magnitude panel visualizes the strength "
+                "of pixel-level attribution associated with the selected class. The SHAP Overlay combines the "
+                "attribution visualization with the original image, making it easier to judge where the model's "
+                "decision may have been influenced. High attribution magnitude means that the corresponding pixels "
+                "were influential in the explanation; it does not mean that the pixels are abnormal, malignant or "
+                "biologically diagnostic.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>Why attribution magnitude matters.</b> A classifier makes its decision from many visual signals "
+                "at once. SHAP attempts to distribute the model output across input features so the reader can see "
+                "which parts of the image were most influential under the explanation procedure. This is useful for "
+                "auditing whether the model appears to be responding to the cell itself, staining patterns, texture, "
+                "edges, background context or other visually salient information. It is not a segmentation algorithm "
+                "and it should not be used to trace a biological structure pixel by pixel.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>How to inspect this cell.</b> First locate the segmented cell in the Original panel. Next compare "
+                "the brightest attribution regions with the same locations in the SHAP Overlay. Then ask whether the "
+                "attribution is concentrated within the cell or whether substantial signal appears along boundaries, "
+                "background areas or neighboring material. Finally compare the SHAP pattern with Grad-CAM for the same "
+                "cell. This sequence helps separate an interpretable cell-centered decision from a decision that may "
+                "be influenced by image context or acquisition artifacts.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                f"<b>Connection to the reported prediction.</b> Cell {cell_id} was assigned <b>{xml_escape(cls)}</b> "
+                f"with <b>{pct(conf)}</b> model confidence. The segmented area is {area:,} pixels and the purple "
+                f"score is {purple:.1f}. SHAP does not independently reclassify the cell; instead, it explains the "
+                "selected model output. Therefore, the attribution map should be read as supporting evidence about "
+                "model behavior, not as a second diagnostic test.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>Important limitation.</b> Pixel attribution can be affected by the image background, preprocessing, "
+                "model architecture and the particular baseline/background used by the SHAP explainer. A visually "
+                "striking attribution does not necessarily represent the most clinically meaningful feature. Likewise, "
+                "a weak or diffuse attribution does not prove that the prediction is invalid. The correct use of SHAP "
+                "in this report is model auditing: it helps the reader understand and question the computational "
+                "decision rather than replacing expert microscopy.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 7))
+
+            story.append(Paragraph(
+                "<b>Interpretive boundary.</b> SHAP attribution is not evidence of AML, leukemia or another disease. "
+                "The five-class classifier can assign a label even when an object is outside the intended biological "
+                "class distribution. For that reason, the original smear, segmentation quality, class probabilities "
+                "and clinical context remain essential when interpreting the result.",
+                styles["BodyText"],
+            ))
+    else:
+        story.append(Paragraph(
+            "SHAP output was unavailable for this analysis. The absence of a SHAP visualization should not be "
+            "interpreted as absence of model evidence; it only indicates that the SHAP explanation stage did not "
+            "produce a usable attribution record.",
+            styles["BodyText"],
+        ))
+    story.append(PageBreak())
+
+    # ---------- 9. Cell-by-cell synthesis ----------
+    section(
+        "Cell-by-Cell Evidence Synthesis",
+        "This section combines the measurable properties of each candidate with its classifier output and the "
+        "availability of Grad-CAM/SHAP evidence. The purpose is to make the reasoning traceable from image object "
+        "to model output to explanation, without converting model evidence into a clinical diagnosis.",
+    )
+
+    synthesis_cells = candidate_df.sort_values("cell_id").head(MAX_XAI_CELLS)
+    if len(synthesis_cells):
+        for _, row in synthesis_cells.iterrows():
+            cell_id = int(row["cell_id"])
+            cls = str(row["predicted_class"])
+            conf = float(row["confidence"])
+            area = int(row["area"])
+            purple = float(row["purple_score"])
+            has_gc = any(int(g["cell_id"]) == cell_id for g in gradcam_records)
+            has_shap = any(int(s["cell_id"]) == cell_id for s in shap_records)
+
+            story.append(Paragraph(
+                f"Cell {cell_id} — {xml_escape(cls)} ({pct(conf)})",
+                styles["CellHeading"],
+            ))
+            story.append(Paragraph(
+                f"<b>Step 1 — Object selection:</b> Cell {cell_id} entered the candidate workflow with a segmented "
+                f"area of <b>{area:,} pixels</b> and a purple score of <b>{purple:.1f}</b>. These measurements describe "
+                "the image-processing stage and are used to decide which segmented objects proceed to classification. "
+                "They do not independently identify the cell type.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 5))
+            story.append(Paragraph(
+                f"<b>Step 2 — Classification:</b> The ResNet50 model selected <b>{xml_escape(cls)}</b> as the top class "
+                f"with <b>{pct(conf)}</b> confidence. This confidence should be understood as the model's preference "
+                "among its five available labels. It is not a calibrated disease probability and should not be "
+                "interpreted as a percentage likelihood of AML or leukemia.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 5))
+            story.append(Paragraph(
+                f"<b>Step 3 — Local explanation:</b> Grad-CAM is "
+                f"{'available' if has_gc else 'not available'} for this cell and SHAP is "
+                f"{'available' if has_shap else 'not available'}. When both are available, they provide complementary "
+                "ways of inspecting the spatial evidence associated with the same prediction. Their role is to help "
+                "identify whether the model appears to rely on the cell region or on potentially confounding visual "
+                "context.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 5))
+            story.append(Paragraph(
+                "<b>Evidence quality:</b> The strength of this computational evidence depends on the quality of the "
+                "segmentation, the representativeness of the crop, staining and imaging conditions, and whether the "
+                "candidate is actually one of the biological categories represented in the training label set. "
+                "A high-confidence prediction can still be wrong when the input is out-of-distribution or when the "
+                "classifier is forced to choose among unsuitable classes.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 5))
+            story.append(Paragraph(
+                "<b>Practical reading:</b> Treat the cell result as a traceable research observation: an object was "
+                "segmented, passed a heuristic selection rule, received a model label, and generated one or more "
+                "visual explanations. The appropriate next action for a suspicious or unexpected result is review of "
+                "the source image and expert laboratory/hematopathology assessment—not escalation of the model score "
+                "into a standalone diagnosis.",
+                styles["BodyText"],
+            ))
+            story.append(Spacer(1, 9))
+
+    if candidate_count > MAX_XAI_CELLS:
+        story.append(Paragraph(
+            f"The analysis contained {candidate_count} candidates, while detailed local XAI was limited to "
+            f"{MAX_XAI_CELLS} cells by configuration. The remaining candidates are represented in the aggregate "
+            "tables but do not have individual Grad-CAM/SHAP pages in this report.",
+            styles["SmallNote"],
         ))
 
     story.append(PageBreak())
-    story.append(Paragraph("Interpretation and Limitations", styles["Heading1"]))
-    limitations = [
-        "The classifier has five closed-set classes: basophil, erythroblast, monocyte, myeloblast and segmented neutrophil.",
-        "RBCs and unknown cell types are not explicit classes and can therefore be forced into one of the five outputs.",
-        "Cellpose segmentation quality affects every downstream result.",
-        "Stain, microscope, illumination and acquisition differences can cause domain shift.",
-        "Confidence is not a calibrated probability of disease.",
-        "A myeloblast-like prediction is not equivalent to an AML diagnosis.",
-        "Clinical assessment requires appropriate hematopathology and laboratory testing.",
-    ]
-    for item in limitations:
-        story.append(Paragraph("• " + item, styles["BodyText"]))
-        story.append(Spacer(1, 5))
 
-    doc.build(story)
+    # ---------- 10. Interpretation ----------
+    section(
+        "Screening-Oriented Interpretation",
+        "A concise interpretation of what this run suggests at the model level, followed by the constraints that "
+        "must be considered before any biological or clinical conclusion.",
+    )
+    if candidate_count == 0:
+        interpretation = (
+            "No candidate cells passed the configured selection rule. This run therefore does not provide a "
+            "meaningful candidate-cell class distribution. A lack of candidates can reflect image quality, "
+            "segmentation behavior or the selection threshold and should not be treated as evidence that abnormal "
+            "cells are absent."
+        )
+    elif myeloblast_count == candidate_count:
+        interpretation = (
+            f"All {candidate_count} candidate cells in this run received <b>myeloblast</b> as the top ResNet50 "
+            f"class, producing a model-level myeloblast-like proportion of <b>{proportion:.2f}%</b>. This is a "
+            "strongly concentrated model output within the available label set. It should prompt careful review "
+            "of the original cells, segmentation quality, staining/domain compatibility and XAI maps rather than "
+            "being converted into a disease probability."
+        )
+    else:
+        interpretation = (
+            f"The pipeline identified {myeloblast_count} myeloblast-like predictions among {candidate_count} "
+            f"candidate cells ({proportion:.2f}%). This is a research-oriented model indicator. The meaning of "
+            "that indicator depends on segmentation quality, the candidate-selection rule and how well the input "
+            "resembles the data used to train the classifier."
+        )
+    story.append(Paragraph(interpretation, styles["BodyText"]))
+    story.append(Spacer(1, 10))
+
+    limitations = [
+        "Cellpose segmentation errors propagate into crop selection and every downstream prediction.",
+        "The purple-score threshold is a heuristic candidate-selection rule, not a validated hematology criterion.",
+        "The classifier is closed-set: RBCs and unknown/non-target cells can be forced into one of five classes.",
+        "Stain, microscope, illumination, focus, magnification and acquisition differences can produce domain shift.",
+        "Small sample counts in a single field can make percentages unstable and should not be generalized to a whole blood sample.",
+        "Classifier confidence is not a calibrated probability of disease.",
+        "Grad-CAM and SHAP explain model behavior but do not prove that highlighted pixels are disease-specific structures.",
+        "A myeloblast-like prediction is not equivalent to an AML or leukemia diagnosis.",
+        "Clinical assessment requires appropriate hematopathology review and laboratory testing.",
+    ]
+    story.append(Paragraph("Key limitations", styles["Heading3"]))
+    for item in limitations:
+        story.append(Paragraph("- " + item, styles["BodyText"]))
+        story.append(Spacer(1, 4))
+
+    story.append(Spacer(1, 8))
+    info_box(
+        "Recommended use",
+        "Use this report to inspect segmentation, compare cell-level model outputs, audit XAI evidence and identify "
+        "cases that merit expert review. Do not use the report alone to diagnose or rule out disease.",
+        "#eff6ff",
+    )
+
+    # ---------- 11. Technical appendix ----------
+    story.append(PageBreak())
+    section(
+        "Technical Appendix",
+        "Reproducibility-oriented details captured from the running SynthMicro pipeline.",
+    )
+    appendix_rows = [
+        ["Parameter", "Configured value"],
+        ["Cell extraction size", "384 × 384 pixels"],
+        ["Candidate purple threshold", "35.0"],
+        ["Maximum detailed XAI cells", "3"],
+        ["SHAP background size", "2"],
+        ["Classifier classes", ", ".join(CLASS_NAMES)],
+        ["Segmentation model", "Cellpose CPSAM (GPU-enabled when available)"],
+        ["Classifier", "ResNet50 Keras model"],
+        ["Local XAI", "Grad-CAM + SHAP GradientExplainer"],
+        ["Optional visual commentary", "Gemini Flash-Lite (asynchronously generated)"],
+    ]
+    at = Table(appendix_rows, colWidths=[2.45*inch, 4.0*inch], repeatRows=1)
+    at.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eef5")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#9ca3af")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(at)
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(
+        "This appendix describes the software pipeline configuration used to generate the report. It does not "
+        "constitute validation of the model for clinical use. Model performance should be established separately "
+        "using an appropriate held-out dataset, calibration analysis and clinically meaningful evaluation metrics.",
+        styles["SmallNote"],
+    ))
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
 
 
 # ============================================================
@@ -1219,7 +1678,7 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
     overlay_path = analysis_dir / "classification_overlay.png"
     save_classification_overlay(smear_bgr, candidate_df, overlay_path)
 
-    # 5. XAI cells = up to MAX_XAI_CELLS highest-confidence myeloblast-like candidates.
+    # 5. XAI cells = up to six highest-confidence myeloblast-like candidates.
     xai_cells = myeloblast_df.head(MAX_XAI_CELLS).copy()
     gradcam_records = []
 
@@ -1259,13 +1718,8 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
     )
     print("========== SHAP FINISHED ==========")
 
-    # 7. Detailed Gemini explanations using original + Grad-CAM + SHAP evidence.
-    explanations = build_vlm_explanations(
-        gradcam_records,
-        shap_records,
-        cell_df,
-        analysis_dir,
-    )
+    # 7. VLM explanations for the selected cell crops.
+    explanations = build_vlm_explanations(gradcam_records, cell_df)
 
     # 8. PDF.
     report_path = XAI_DIR / f"{analysis_id}_Phase7_XAI_Report.pdf"
@@ -1401,8 +1855,9 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
         ],
         "shap_available": bool(shap_records),
         "shap_error": shap_error,
-        "vlm_model": GEMINI_MODEL,
-        "vlm_enabled": bool(GEMINI_API_KEY and genai is not None),
+        "gemini_model": GEMINI_MODEL,
+        "gemini_enabled": bool(GEMINI_API_KEY and genai is not None),
+        "gemini_status_url": f"/analysis/{analysis_id}/gemini",
         "report_url": f"/reports/{analysis_id}",
         "overlay_url": f"/analysis/{analysis_id}/files/{overlay_path.name}",
         "original_url": f"/analysis/{analysis_id}/files/{original_path.name}",
@@ -1417,7 +1872,7 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
 def root():
     return {
         "status": "running",
-        "pipeline": "Cellpose -> ResNet50 -> Grad-CAM -> SHAP -> Gemini VLM -> PDF",
+        "pipeline": "Cellpose -> ResNet50 -> Grad-CAM -> SHAP -> Gemini Flash-Lite -> PDF",
         "model": ACTIVE_MODEL_PATH.name,
         "input_size": IMG_SIZE,
         "classes": CLASS_NAMES,
@@ -1434,12 +1889,12 @@ def health():
         "cellpose_available": True,
         "shap_available": shap is not None,
         "gemini_available": genai is not None,
-        "gemini_api_key_configured": bool(GEMINI_API_KEY),
+        "gemini_key_configured": bool(GEMINI_API_KEY),
     }
 
 
 @app.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     allowed_types = {"image/jpeg", "image/jpg", "image/png"}
     if file.content_type not in allowed_types:
         return {
@@ -1456,6 +1911,39 @@ async def predict(file: UploadFile = File(...)):
         analysis_id = uuid.uuid4().hex
 
         result = run_analysis(image, analysis_id)
+        # Gemini is deliberately decoupled from the critical ML/XAI path.
+        # The UI receives Cellpose/ResNet/Grad-CAM/SHAP immediately and polls
+        # this background job for the optional visual commentary.
+        if background_tasks is not None and result.get("gemini_enabled"):
+            # Reconstruct the lightweight inputs needed by the Gemini worker.
+            analysis_dir = XAI_DIR / analysis_id
+            records = []
+            for item in result.get("gradcam_records", []):
+                cell_id = int(item["cell_id"])
+                original_cell = analysis_dir / f"cell_{cell_id}_original.png"
+                records.append({
+                    "cell_id": cell_id,
+                    "class": item["class"],
+                    "confidence": item["confidence"],
+                    "original_path": str(original_cell),
+                })
+            # Persist enough metadata for the background worker without keeping
+            # the pandas DataFrame alive after the request.
+            meta = pd.DataFrame([
+                {
+                    "cell_id": r["cell_id"],
+                    "predicted_class": r["class"],
+                    "confidence": r["confidence"],
+                } for r in records
+            ])
+            background_tasks.add_task(run_gemini_background, analysis_id, records, meta)
+        else:
+            write_gemini_status(analysis_id, {
+                "analysis_id": analysis_id,
+                "status": "disabled",
+                "model": GEMINI_MODEL,
+                "results": {},
+            })
         result["success"] = True
         return result
 
@@ -1465,6 +1953,19 @@ async def predict(file: UploadFile = File(...)):
             "success": False,
             "error": str(exc),
         }
+
+
+@app.get("/analysis/{analysis_id}/gemini")
+def get_gemini_status(analysis_id: str):
+    path = _gemini_status_path(analysis_id)
+    if not path.exists():
+        return {
+            "analysis_id": analysis_id,
+            "status": "queued",
+            "model": GEMINI_MODEL,
+            "results": {},
+        }
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @app.get("/reports/{analysis_id}")

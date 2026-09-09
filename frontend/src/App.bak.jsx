@@ -42,9 +42,6 @@ function App() {
   const [dragActive, setDragActive] = useState(false);
   const [viewMode, setViewMode] = useState("original");
   const [selectedXaiCell, setSelectedXaiCell] = useState(null);
-  const [geminiStatus, setGeminiStatus] = useState("idle");
-  const [geminiAnalysis, setGeminiAnalysis] = useState({});
-  const [geminiError, setGeminiError] = useState("");
 
   useEffect(() => {
     return () => {
@@ -70,14 +67,8 @@ function App() {
     setPreview(URL.createObjectURL(file));
     setResult(null);
     setError("");
-    setGeminiStatus("idle");
-    setGeminiAnalysis({});
-    setGeminiError("");
     setViewMode("original");
     setSelectedXaiCell(null);
-    setGeminiStatus("idle");
-    setGeminiAnalysis({});
-    setGeminiError("");
   };
 
   const handleFileChange = (event) => {
@@ -99,9 +90,6 @@ function App() {
     setLoading(true);
     setError("");
     setResult(null);
-    setGeminiStatus("idle");
-    setGeminiAnalysis({});
-    setGeminiError("");
 
     try {
       const formData = new FormData();
@@ -145,15 +133,6 @@ function App() {
       if (normalized.gradcamRecords.length > 0) {
         setSelectedXaiCell(normalized.gradcamRecords[0].cell_id);
       }
-
-      // Gemini is started by the backend independently of the main ML/XAI response.
-      // The UI polls its status so local analysis never waits for Gemini.
-      if (normalized.analysis_id || normalized.gemini_analysis_id) {
-        setGeminiStatus("processing");
-      } else {
-        setGeminiStatus("unavailable");
-      }
-
       setViewMode("overlay");
 
       setTimeout(() => {
@@ -172,61 +151,6 @@ function App() {
       setLoading(false);
     }
   };
-
-  useEffect(() => {
-    const analysisId = result?.analysis_id || result?.gemini_analysis_id;
-    if (!analysisId || geminiStatus !== "processing") return undefined;
-
-    let cancelled = false;
-    let timer = null;
-
-    const pollGemini = async () => {
-      try {
-        const response = await fetch(
-          `${API_URL}/analysis/${encodeURIComponent(analysisId)}/gemini`
-        );
-        const data = await response.json();
-
-        if (cancelled) return;
-
-        if (!response.ok) {
-          throw new Error(
-            data?.error || `Gemini status error (${response.status})`
-          );
-        }
-
-        const status = data.status || "processing";
-
-        if (status === "completed" || status === "complete") {
-          setGeminiAnalysis(
-            data.results || data.analyses || data.gemini || {}
-          );
-          setGeminiStatus("completed");
-          setGeminiError("");
-          return;
-        }
-
-        if (status === "failed" || status === "error") {
-          setGeminiStatus("failed");
-          setGeminiError(data.error || "Gemini visual analysis failed.");
-          return;
-        }
-
-        timer = window.setTimeout(pollGemini, 2000);
-      } catch (err) {
-        if (cancelled) return;
-        console.warn("Gemini polling error:", err);
-        timer = window.setTimeout(pollGemini, 4000);
-      }
-    };
-
-    pollGemini();
-
-    return () => {
-      cancelled = true;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [result?.analysis_id, result?.gemini_analysis_id, geminiStatus]);
 
   const resetAnalysis = () => {
     if (preview) URL.revokeObjectURL(preview);
@@ -254,21 +178,6 @@ function App() {
     result?.shapRecords?.find(
       (item) => item.cell_id === selectedXaiCell
     ) || result?.shapRecords?.[0];
-
-  const selectedGemini =
-    geminiAnalysis?.[selectedXaiCell] ||
-    geminiAnalysis?.[String(selectedXaiCell)] ||
-    geminiAnalysis?.results?.[selectedXaiCell] ||
-    null;
-
-  const geminiText =
-    typeof selectedGemini === "string"
-      ? selectedGemini
-      : selectedGemini?.text ||
-        selectedGemini?.analysis ||
-        selectedGemini?.explanation ||
-        selectedGemini?.output ||
-        "";
 
   const screeningTone =
     result?.screening_level === "ELEVATED_SCREENING_INDICATOR"
@@ -299,7 +208,7 @@ function App() {
           <div className="topbar-right">
             <div className="model-pill">
               <span className="live-dot"></span>
-              Cellpose + ResNet50 + XAI + Gemini
+              Cellpose + ResNet50 + XAI
             </div>
             <div className="model-name">Phase 7</div>
           </div>
@@ -328,7 +237,7 @@ function App() {
                 <span><b>01</b> Cellpose</span>
                 <span><b>02</b> ResNet50</span>
                 <span><b>03</b> Grad-CAM + SHAP</span>
-                <span><b>04</b> Gemini Visual Analysis</span>
+                <span><b>04</b> HF Report</span>
               </div>
             </div>
 
@@ -498,74 +407,8 @@ function App() {
             <section className="information-section">
               <div className="info-card cell-card">
                 <div className="info-card-heading">
-                  <div className="info-icon">AI</div>
-                  <div>
-                    <span className="section-eyebrow">SIDE-BY-SIDE ANALYSIS</span>
-                    <h3>Local Model + Gemini</h3>
-                  </div>
-                </div>
-                <div style={{
-                  display: "grid",
-                  gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
-                  gap: 18,
-                }}>
-                  <div>
-                    <span className="sidebar-label">MODEL / XAI</span>
-                    <h4 style={{ margin: "8px 0" }}>
-                      {selectedGradcam
-                        ? `Cell ${selectedGradcam.cell_id} · ${formatClassName(selectedGradcam.class)}`
-                        : "Select an XAI cell"}
-                    </h4>
-                    <p>
-                      {selectedGradcam
-                        ? `${(selectedGradcam.confidence * 100).toFixed(1)}% classifier confidence. Grad-CAM and SHAP are generated locally.`
-                        : "Local model evidence is available above."}
-                    </p>
-                  </div>
-
-                  <div>
-                    <span className="sidebar-label">GEMINI 3.5 FLASH-LITE</span>
-                    {geminiStatus === "processing" && (
-                      <p style={{ marginTop: 8 }}>
-                        <span className="button-spinner"></span>{" "}
-                        Gemini is analyzing the cell imagery…
-                      </p>
-                    )}
-                    {geminiStatus === "completed" && geminiText && (
-                      <p style={{ marginTop: 8, whiteSpace: "pre-wrap", lineHeight: 1.6 }}>
-                        {geminiText}
-                      </p>
-                    )}
-                    {geminiStatus === "completed" && !geminiText && (
-                      <p style={{ marginTop: 8 }}>
-                        Gemini completed, but no commentary was returned for the selected cell.
-                      </p>
-                    )}
-                    {geminiStatus === "failed" && (
-                      <p style={{ marginTop: 8 }}>
-                        {geminiError || "Gemini visual analysis failed."}
-                      </p>
-                    )}
-                    {geminiStatus === "unavailable" && (
-                      <p style={{ marginTop: 8 }}>
-                        Gemini background analysis is unavailable for this result.
-                      </p>
-                    )}
-                  </div>
-                </div>
-                <p style={{ marginTop: 14 }}>
-                  Gemini provides visual commentary only; it does not diagnose
-                  leukemia, AML, cancer, or any other disease.
-                </p>
-              </div>
-
-              <div className="info-card probabilities-card">
-                <div className="info-card-heading">
                   <div className="info-icon">◉</div>
-                  <div>
-                    <span className="section-eyebrow">SEGMENTATION</span>
-                    <h3>Cellpose Results</h3>
-                  </div>
+                  <div><span className="section-eyebrow">SEGMENTATION</span><h3>Cellpose Results</h3></div>
                 </div>
                 <p>
                   The whole smear was segmented first. Only candidates with a
@@ -681,22 +524,15 @@ function App() {
               <div className="info-card cell-card">
                 <div className="info-card-heading">
                   <div className="info-icon">AI</div>
-                  <div><span className="section-eyebrow">VISUAL AI</span><h3>Gemini 3.5 Flash-Lite</h3></div>
+                  <div><span className="section-eyebrow">REPORT GENERATION</span><h3>Hugging Face VLM</h3></div>
                 </div>
                 <p>
-                  Gemini 3.5 Flash-Lite runs as a separate visual-analysis branch. The local
-                  Cellpose, ResNet50, Grad-CAM and SHAP results are displayed without
-                  waiting for Gemini; its commentary is added when available.
+                  The PDF report uses the configured Hugging Face vision-language
+                  model to produce conservative explanations for selected cell
+                  evidence. If HF inference is unavailable, the report falls back
+                  to deterministic model-output explanations.
                 </p>
-                <strong>{geminiStatus === "processing"
-                    ? "Gemini visual analysis in progress…"
-                    : geminiStatus === "completed"
-                    ? "Gemini visual analysis ready"
-                    : geminiStatus === "failed"
-                    ? "Gemini failed — local ML/XAI results remain available"
-                    : geminiStatus === "unavailable"
-                    ? "Gemini background analysis was not started"
-                    : "Gemini ready"}</strong>
+                <strong>{result.vlm_enabled ? "VLM explanation enabled" : "VLM token not configured — fallback explanations used"}</strong>
               </div>
 
               <div className="info-card probabilities-card">
@@ -733,7 +569,7 @@ function App() {
       <footer className="footer">
         <div className="footer-inner">
           <div><strong>SynthMicro</strong><span>Explainable whole-smear blood-cell analysis</span></div>
-          <div className="footer-tech">Cellpose <span>•</span> ResNet50 <span>•</span> Grad-CAM <span>•</span> SHAP <span>•</span> Gemini 3.5 Flash-Lite</div>
+          <div className="footer-tech">Cellpose <span>•</span> ResNet50 <span>•</span> Grad-CAM <span>•</span> SHAP <span>•</span> Hugging Face</div>
         </div>
       </footer>
     </div>
