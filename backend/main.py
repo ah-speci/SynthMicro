@@ -103,8 +103,8 @@ CLASS_NAMES = [
 ]
 
 PURPLE_THRESHOLD = 35.0
-MAX_XAI_CELLS = 6
-SHAP_BACKGROUND_SIZE = 10
+MAX_XAI_CELLS = 3
+SHAP_BACKGROUND_SIZE = 2
 
 # Hugging Face model used by the explanatory report layer.
 HF_VLM_MODEL = os.getenv(
@@ -168,6 +168,16 @@ else:
         f"  {MODEL_PATH}\n"
         f"  {FALLBACK_MODEL_PATH}"
     )
+
+# Keep TensorFlow from reserving the entire GPU up front.
+# This is especially useful on the 6-GB RTX 4050 because SHAP and
+# ResNet50 temporarily need additional VRAM during gradient calculation.
+try:
+    for gpu in tf.config.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(gpu, True)
+        print("TensorFlow GPU memory growth enabled:", gpu)
+except Exception as exc:
+    print("GPU memory-growth configuration warning:", exc)
 
 print("=" * 70)
 print("SynthMicro Phase 7 backend")
@@ -525,6 +535,20 @@ def save_shap(cell_bgr: np.ndarray, shap_display: np.ndarray, path: Path, label:
 
 
 def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: Path):
+    """
+    Generate SHAP explanations for the selected cells.
+
+    This configuration is deliberately tuned for a 6-GB GPU:
+      * only a tiny background is used;
+      * GradientExplainer's internal batch_size is forced to 1;
+      * only the top-ranked model output is explained;
+      * nsamples is kept modest.
+
+    The important fix is ``batch_size=1`` on GradientExplainer itself.
+    SHAP 0.52 accepts this in the constructor, while ``shap_values()``
+    does not expose a batch_size argument.
+    """
+
     if shap is None:
         return [], f"SHAP is unavailable: {SHAP_IMPORT_ERROR}"
 
@@ -532,35 +556,110 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
         return [], "No selected cells available for SHAP."
 
     background = X_preprocessed[:min(SHAP_BACKGROUND_SIZE, len(X_preprocessed))]
-    explainer = shap.GradientExplainer(model, background)
+
+    print(
+        f"SHAP: background={background.shape}, "
+        f"selected_cells={len(selected_df)}"
+    )
+
+    # SHAP 0.52 constructor supports batch_size; setting it here prevents
+    # the default batch of 50 from creating a large [50, 512, 48, 48]
+    # activation tensor inside ResNet50.
+    explainer = shap.GradientExplainer(
+        model,
+        background,
+        batch_size=1,
+        local_smoothing=0,
+    )
+
     records = []
 
     for _, row in selected_df.iterrows():
         cell_id = int(row["cell_id"])
-        idx = int(cell_df.index[cell_df["cell_id"] == cell_id][0])
+        matches = cell_df.index[cell_df["cell_id"] == cell_id]
+        if len(matches) == 0:
+            print(f"SHAP: Cell {cell_id} not found in cell dataframe; skipping.")
+            continue
+
+        idx = int(matches[0])
         image_input = X_preprocessed[idx:idx + 1]
+
         predicted_index = int(np.argmax(row["prediction_vector"]))
         predicted_class = CLASS_NAMES[predicted_index]
         confidence = float(row["confidence"])
 
-        values_all = explainer.shap_values(image_input)
+        print(
+            f"SHAP: Cell {cell_id} -> {predicted_class} "
+            f"({confidence * 100:.1f}%), starting..."
+        )
 
-        # Current notebook output: ndarray (1, 384, 384, 3, 5).
-        # Older SHAP versions may return a list with one ndarray per class.
-        if isinstance(values_all, list):
-            class_values = np.asarray(values_all[predicted_index])
+        # Explain only the highest-ranked output. For this classifier, the
+        # highest-ranked output is the same class already stored in the row.
+        shap_result = explainer.shap_values(
+            image_input,
+            nsamples=50,
+            ranked_outputs=1,
+            output_rank_order="max",
+            rseed=0,
+            return_variances=False,
+        )
+
+        # With ranked_outputs=1, SHAP returns:
+        #   (shap_values, indexes)
+        # The exact ndarray/list shape differs slightly between SHAP versions,
+        # so normalize it defensively.
+        if (
+            isinstance(shap_result, tuple)
+            and len(shap_result) == 2
+        ):
+            values_all, indexes = shap_result
+            values_array = np.asarray(values_all)
+            indexes_array = np.asarray(indexes)
+
+            # For one ranked output the class dimension is the final axis.
+            # Typical SHAP 0.52 output is (1, H, W, C, 1).
+            if values_array.ndim == 5:
+                values = values_array[0, :, :, :, 0]
+            elif values_array.ndim == 4:
+                values = values_array[0]
+            elif values_array.ndim == 3:
+                values = values_array
+            else:
+                raise RuntimeError(
+                    f"Unexpected ranked SHAP output shape: {values_array.shape}"
+                )
+
+            # Sanity-check the ranked class when SHAP supplies indexes.
+            try:
+                shap_class_index = int(indexes_array.reshape(-1)[0])
+                if shap_class_index != predicted_index:
+                    print(
+                        f"SHAP warning: ranked class {shap_class_index} differs "
+                        f"from predicted class {predicted_index}."
+                    )
+            except Exception:
+                pass
+
+        elif isinstance(shap_result, list):
+            # Compatibility path for older SHAP TensorFlow return formats.
+            class_values = np.asarray(shap_result[predicted_index])
             if class_values.ndim == 4:
                 values = class_values[0]
             else:
                 values = class_values
+
         else:
-            values_array = np.asarray(values_all)
+            values_array = np.asarray(shap_result)
             if values_array.ndim == 5:
                 values = values_array[0, :, :, :, predicted_index]
             elif values_array.ndim == 4:
                 values = values_array[0]
+            elif values_array.ndim == 3:
+                values = values_array
             else:
-                raise RuntimeError(f"Unexpected SHAP output shape: {values_array.shape}")
+                raise RuntimeError(
+                    f"Unexpected SHAP output shape: {values_array.shape}"
+                )
 
         if values.ndim == 3:
             shap_magnitude = np.mean(np.abs(values), axis=-1)
@@ -569,6 +668,7 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
 
         low = np.percentile(shap_magnitude, 1)
         high = np.percentile(shap_magnitude, 99)
+
         shap_display = np.clip(
             (shap_magnitude - low) / (high - low + 1e-8),
             0,
@@ -576,6 +676,7 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
         )
 
         path = output_dir / f"cell_{cell_id}_shap.png"
+
         save_shap(
             X[idx],
             shap_display,
@@ -592,6 +693,11 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
                 "path": str(path),
             }
         )
+
+        # Release temporary references before the next cell.
+        del shap_result
+        del image_input
+        print(f"SHAP: Cell {cell_id} finished -> {path}")
 
     return records, None
 
@@ -611,6 +717,7 @@ def hf_explain_image(image_path: Path, prompt: str) -> str:
 
     client = InferenceClient(
         model=HF_VLM_MODEL,
+	provider="featherless-ai",
         token=HF_TOKEN,
         timeout=120,
     )
