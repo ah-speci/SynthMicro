@@ -7,6 +7,7 @@ import base64
 import uuid
 import sqlite3
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -33,10 +34,10 @@ except Exception as exc:
     SHAP_IMPORT_ERROR = str(exc)
 
 try:
-    from huggingface_hub import InferenceClient
+    from google import genai
 except Exception as exc:
-    InferenceClient = None
-    HF_IMPORT_ERROR = str(exc)
+    genai = None
+    GEMINI_IMPORT_ERROR = str(exc)
 
 from tensorflow.keras.applications.resnet50 import preprocess_input
 
@@ -63,7 +64,7 @@ app = FastAPI(
     title="SynthMicro API",
     description=(
         "Whole blood-smear analysis using Cellpose, ResNet50, "
-        "Grad-CAM, SHAP and an optional Hugging Face VLM report."
+        "Grad-CAM, SHAP and an optional Gemini VLM report."
     ),
     version="2.0.0",
 )
@@ -106,12 +107,10 @@ PURPLE_THRESHOLD = 35.0
 MAX_XAI_CELLS = 3
 SHAP_BACKGROUND_SIZE = 2
 
-# Hugging Face model used by the explanatory report layer.
-HF_VLM_MODEL = os.getenv(
-    "HF_VLM_MODEL",
-    "Qwen/Qwen2.5-VL-3B-Instruct",
-)
-HF_TOKEN = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+# Google Gemini model used by the explanatory report layer.
+# Gemini is cloud-hosted and is not loaded onto the RTX 4050.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 XAI_DIR.mkdir(parents=True, exist_ok=True)
@@ -703,59 +702,109 @@ def generate_shap_records(X_preprocessed, X, cell_df, selected_df, output_dir: P
 
 
 # ============================================================
-# VLM REPORT EXPLANATIONS
+# GEMINI VLM REPORT EXPLANATIONS
 # ============================================================
 
-def hf_explain_image(image_path: Path, prompt: str) -> str:
-    """Use HF Qwen2.5-VL when HF_TOKEN is configured."""
-    if InferenceClient is None:
-        raise RuntimeError(f"huggingface_hub is unavailable: {HF_IMPORT_ERROR}")
-    if not HF_TOKEN:
+def make_vlm_evidence_image(
+    original_path: Path,
+    gradcam_path: Path | None,
+    shap_path: Path | None,
+    output_path: Path,
+):
+    """Create an Original + Grad-CAM + SHAP evidence image for Gemini."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    images = [Image.open(original_path).convert("RGB")]
+    titles = ["Original Cell"]
+
+    if gradcam_path and Path(gradcam_path).exists():
+        images.append(Image.open(gradcam_path).convert("RGB"))
+        titles.append("Grad-CAM")
+
+    if shap_path and Path(shap_path).exists():
+        images.append(Image.open(shap_path).convert("RGB"))
+        titles.append("SHAP")
+
+    fig, axes = plt.subplots(1, len(images), figsize=(5 * len(images), 4))
+    if len(images) == 1:
+        axes = [axes]
+
+    for ax, image, title in zip(axes, images, titles):
+        ax.imshow(image)
+        ax.set_title(title)
+        ax.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+
+
+def gemini_explain_image(image_path: Path, prompt: str) -> str:
+    """Generate a detailed cloud explanation using Gemini 2.5 Flash."""
+    if genai is None:
         raise RuntimeError(
-            "HF_TOKEN is not configured. Set HF_TOKEN in the backend environment."
+            f"google-genai is unavailable: {GEMINI_IMPORT_ERROR}"
         )
 
-    client = InferenceClient(
-        model=HF_VLM_MODEL,
-	provider="featherless-ai",
-        token=HF_TOKEN,
-        timeout=120,
-    )
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured. "
+            "Set GEMINI_API_KEY in the backend environment."
+        )
 
-    data_url = file_to_data_url(image_path)
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    image = Image.open(image_path).convert("RGB")
 
-    response = client.chat.completions.create(
-        model=HF_VLM_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an explanatory assistant for a research blood-smear "
-                    "image-analysis system. Do not diagnose cancer or leukemia. "
-                    "Do not invent morphology that is not visible. Explain model "
-                    "results conservatively and explicitly distinguish model output "
-                    "from clinical diagnosis."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
-            },
-        ],
-        max_tokens=350,
-        temperature=0.2,
-    )
+    # Retry transient API/rate-limit/server errors.
+    delays = [5, 15, 30, 60]
 
-    return response.choices[0].message.content.strip()
+    for attempt, delay in enumerate(delays + [0]):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[prompt, image],
+                config={
+                    "system_instruction": (
+                        "You are an explanatory assistant for a research-oriented "
+                        "blood-smear image-analysis system. Do not diagnose "
+                        "leukemia, AML, cancer, or any disease. Distinguish "
+                        "visible observations from machine-learning predictions. "
+                        "Never invent morphology. Treat Grad-CAM and SHAP as "
+                        "model-attribution evidence, not direct biological "
+                        "measurements."
+                    ),
+                    "temperature": 0.2,
+                    "max_output_tokens": 900,
+                },
+            )
+
+            if not response.text:
+                raise RuntimeError("Gemini returned an empty response.")
+
+            return response.text.strip()
+
+        except Exception as exc:
+            error_text = str(exc).lower()
+            retryable = any(
+                marker in error_text
+                for marker in (
+                    "429", "500", "502", "503", "504",
+                    "resource exhausted", "unavailable",
+                    "temporarily", "rate limit", "deadline",
+                )
+            )
+
+            if retryable and attempt < len(delays):
+                print(
+                    f"Gemini temporarily unavailable "
+                    f"(attempt {attempt + 1}/5). Retrying in {delay}s..."
+                )
+                time.sleep(delay)
+                continue
+
+            raise
 
 
 def fallback_cell_explanation(row: dict) -> str:
@@ -775,27 +824,134 @@ def fallback_cell_explanation(row: dict) -> str:
     )
 
 
-def build_vlm_explanations(selected_records, cell_df):
+def build_vlm_explanations(
+    selected_records,
+    shap_records,
+    cell_df,
+    analysis_dir: Path,
+):
+    """Generate detailed Gemini explanations using the original and XAI panels."""
     explanations = {}
+
+    shap_by_cell = {int(rec["cell_id"]): rec for rec in shap_records}
+
     for rec in selected_records:
-        cell_id = rec["cell_id"]
-        row = cell_df.loc[cell_df["cell_id"] == cell_id].iloc[0].to_dict()
-        prompt = (
-            f"This segmented microscopy crop was classified by ResNet50 as "
-            f"'{row['predicted_class']}' with {row['confidence'] * 100:.1f}% confidence. "
-            "Explain in 3-5 sentences what is visibly present in the image and how "
-            "the result can be interpreted as model behavior. Mention uncertainty "
-            "and domain limitations. Do not diagnose leukemia/cancer and do not "
-            "claim a cell type that cannot be supported from the image."
-        )
+        cell_id = int(rec["cell_id"])
+        matches = cell_df.loc[cell_df["cell_id"] == cell_id]
+
+        if matches.empty:
+            continue
+
+        row = matches.iloc[0].to_dict()
+        shap_rec = shap_by_cell.get(cell_id)
+        evidence_path = analysis_dir / f"cell_{cell_id}_gemini_evidence.png"
+
         try:
-            explanations[cell_id] = hf_explain_image(
-                Path(rec["original_path"]),
+            make_vlm_evidence_image(
+                original_path=Path(rec["original_path"]),
+                gradcam_path=Path(rec["path"]),
+                shap_path=Path(shap_rec["path"]) if shap_rec else None,
+                output_path=evidence_path,
+            )
+
+            area = row.get("area", "not available")
+            purple = row.get("purple_score", "not available")
+            purple_text = (
+                f"{float(purple):.2f}"
+                if isinstance(purple, (float, int, np.floating, np.integer))
+                else str(purple)
+            )
+
+            probability_text = "not available"
+            prediction_vector = row.get("prediction_vector")
+            if prediction_vector is not None:
+                try:
+                    vector = np.asarray(prediction_vector, dtype=float)
+                    probability_text = ", ".join(
+                        f"{CLASS_NAMES[i]}={vector[i] * 100:.2f}%"
+                        for i in range(min(len(CLASS_NAMES), len(vector)))
+                    )
+                except Exception:
+                    pass
+
+            prompt = f"""
+Analyze the supplied evidence image for Cell {cell_id} from a
+research-oriented blood-smear computer-vision system.
+
+The image contains:
+1. Original segmented cell
+2. Grad-CAM visualization
+3. SHAP attribution visualization
+
+MODEL INFORMATION
+- ResNet50 predicted class: {row["predicted_class"]}
+- Model confidence: {row["confidence"] * 100:.2f}%
+- Cell area: {area} pixels
+- Purple score: {purple_text}
+- Class probabilities: {probability_text}
+
+Write a detailed scientific-style explanation using EXACTLY these sections:
+
+1. Visible morphology
+Describe only features actually visible in the original cell. Discuss apparent
+cell shape, nucleus, nuclear-to-cytoplasmic relationship, chromatin appearance,
+nucleoli if clearly visible, cytoplasm, granularity, staining and boundaries.
+If a feature cannot be reliably determined, say so.
+
+2. Relationship to the ResNet50 prediction
+Explain which visible characteristics may be compatible with the predicted
+class. Clearly separate direct visual observations from the neural-network
+classification.
+
+3. Alternative class considerations
+Discuss which other closed-set classes could potentially overlap with the
+appearance. Available classes: basophil, erythroblast, monocyte, myeloblast,
+seg_neutrophil.
+
+4. Confidence and uncertainty
+Explain the meaning and limitations of the model confidence. Do not interpret
+confidence as a probability of leukemia, AML or cancer.
+
+5. Grad-CAM interpretation
+Describe where Grad-CAM activation appears concentrated: inside the cell,
+near its boundary, or in surrounding/background areas. Do not claim that an
+activation region definitively represents a biological structure.
+
+6. SHAP interpretation
+Describe where SHAP attribution appears concentrated. Explain that SHAP
+represents pixel-level contribution toward the selected model output and is
+not a direct biological measurement.
+
+7. Agreement between XAI methods
+State whether Grad-CAM and SHAP appear broadly consistent or different.
+Do not overstate agreement.
+
+8. Limitations
+Discuss segmentation quality, staining/illumination variation, image quality,
+dataset limitations, closed-set classification, domain shift and possible
+model misclassification.
+
+9. Conclusion
+Give a concise conclusion about this cell's model-level result.
+
+IMPORTANT:
+- Do not diagnose AML, leukemia, cancer or any disease.
+- A myeloblast prediction does not establish malignancy.
+- Do not invent biological structures.
+- Do not call model confidence a disease probability.
+- If image quality prevents a reliable observation, say so.
+- XAI panels describe model behavior, not biological causality.
+"""
+
+            explanations[cell_id] = gemini_explain_image(
+                evidence_path,
                 prompt,
             )
+
         except Exception as exc:
             explanations[cell_id] = fallback_cell_explanation(row)
-            print(f"HF explanation unavailable for Cell {cell_id}: {exc}")
+            print(f"Gemini explanation unavailable for Cell {cell_id}: {exc}")
+
     return explanations
 
 
@@ -855,7 +1011,7 @@ def make_pdf_report(
     story.append(Spacer(1, 14))
     story.append(Paragraph(
         "Pipeline: Cellpose segmentation → 384×384 cell extraction → "
-        "ResNet50 classification → Grad-CAM → SHAP → explanatory report.",
+        "ResNet50 classification → Grad-CAM → SHAP → Gemini 2.5 Flash explanatory report.",
         styles["BodyText"],
     ))
     story.append(Spacer(1, 14))
@@ -1063,7 +1219,7 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
     overlay_path = analysis_dir / "classification_overlay.png"
     save_classification_overlay(smear_bgr, candidate_df, overlay_path)
 
-    # 5. XAI cells = up to six highest-confidence myeloblast-like candidates.
+    # 5. XAI cells = up to MAX_XAI_CELLS highest-confidence myeloblast-like candidates.
     xai_cells = myeloblast_df.head(MAX_XAI_CELLS).copy()
     gradcam_records = []
 
@@ -1103,8 +1259,13 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
     )
     print("========== SHAP FINISHED ==========")
 
-    # 7. VLM explanations for the selected cell crops.
-    explanations = build_vlm_explanations(gradcam_records, cell_df)
+    # 7. Detailed Gemini explanations using original + Grad-CAM + SHAP evidence.
+    explanations = build_vlm_explanations(
+        gradcam_records,
+        shap_records,
+        cell_df,
+        analysis_dir,
+    )
 
     # 8. PDF.
     report_path = XAI_DIR / f"{analysis_id}_Phase7_XAI_Report.pdf"
@@ -1240,8 +1401,8 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
         ],
         "shap_available": bool(shap_records),
         "shap_error": shap_error,
-        "vlm_model": HF_VLM_MODEL,
-        "vlm_enabled": bool(HF_TOKEN and InferenceClient is not None),
+        "vlm_model": GEMINI_MODEL,
+        "vlm_enabled": bool(GEMINI_API_KEY and genai is not None),
         "report_url": f"/reports/{analysis_id}",
         "overlay_url": f"/analysis/{analysis_id}/files/{overlay_path.name}",
         "original_url": f"/analysis/{analysis_id}/files/{original_path.name}",
@@ -1256,12 +1417,12 @@ def run_analysis(original_image: Image.Image, analysis_id: str):
 def root():
     return {
         "status": "running",
-        "pipeline": "Cellpose -> ResNet50 -> Grad-CAM -> SHAP -> Hugging Face VLM -> PDF",
+        "pipeline": "Cellpose -> ResNet50 -> Grad-CAM -> SHAP -> Gemini VLM -> PDF",
         "model": ACTIVE_MODEL_PATH.name,
         "input_size": IMG_SIZE,
         "classes": CLASS_NAMES,
-        "hf_vlm_model": HF_VLM_MODEL,
-        "hf_vlm_enabled": bool(HF_TOKEN and InferenceClient is not None),
+        "gemini_model": GEMINI_MODEL,
+        "gemini_enabled": bool(GEMINI_API_KEY and genai is not None),
     }
 
 
@@ -1272,8 +1433,8 @@ def health():
         "model": ACTIVE_MODEL_PATH.name,
         "cellpose_available": True,
         "shap_available": shap is not None,
-        "huggingface_available": InferenceClient is not None,
-        "hf_token_configured": bool(HF_TOKEN),
+        "gemini_available": genai is not None,
+        "gemini_api_key_configured": bool(GEMINI_API_KEY),
     }
 
 
